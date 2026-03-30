@@ -1,0 +1,55 @@
+import zipfile
+import shutil
+import os
+
+# Step 1: Create a copy of train
+if os.path.exists("dataset/images/train_with_external"):
+    shutil.rmtree("dataset/images/train_with_external")
+if os.path.exists("dataset/labels/train_with_external"):
+    shutil.rmtree("dataset/labels/train_with_external")
+
+shutil.copytree("dataset/images/train", "dataset/images/train_with_external")
+shutil.copytree("dataset/labels/train", "dataset/labels/train_with_external")
+print("Copy created")
+
+# Step 2: Add external data to the copy
+for zip_name in ["external_part_1_new.zip", "external_part_2_new.zip"]:
+    if os.path.exists(zip_name):
+        print(f"Extracting {zip_name}...")
+        with zipfile.ZipFile(zip_name, 'r') as z:
+            for name in z.namelist():
+                fname = os.path.basename(name)
+                if not fname:
+                    continue
+                if "images" in name:
+                    z.extract(name, "./temp_extract")
+                    shutil.move(f"./temp_extract/{name}", f"dataset/images/train_with_external/{fname}")
+                elif "labels" in name:
+                    z.extract(name, "./temp_extract")
+                    shutil.move(f"./temp_extract/{name}", f"dataset/labels/train_with_external/{fname}")
+
+if os.path.exists("./temp_extract"):
+    shutil.rmtree("./temp_extract")
+
+img_count = len(os.listdir("dataset/images/train_with_external"))
+lbl_count = len(os.listdir("dataset/labels/train_with_external"))
+print(f"\nNew training set: {img_count} images, {lbl_count} labels")
+
+
+import yaml
+
+data = {
+    'path': os.path.abspath("dataset"),
+    'train': 'images/train_with_external',
+    'val': 'images/val',
+    'test': 'images/test',
+    'nc': 3,
+    'names': ['soldier', 'barrier', 'civilian'],
+}
+
+with open("dataset/data_with_external.yaml", 'w') as f:
+    yaml.dump(data, f, default_flow_style=False)
+
+print("Saved: dataset/data_with_external.yaml")
+
+
