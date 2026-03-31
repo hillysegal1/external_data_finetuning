@@ -1,0 +1,23 @@
+import zipfile, shutil, os
+
+# Step 1: Add images from Colab annotator ZIP
+with zipfile.ZipFile("bdd_annotator_part_1.zip", 'r') as z:
+    for name in z.namelist():
+        fname = os.path.basename(name)
+        if fname.lower().endswith(('.jpg', '.jpeg', '.png')):
+            z.extract(name, "./temp")
+            shutil.move(f"./temp/{name}", f"dataset/images/train_with_external/{fname}")
+
+# Step 2: Add corrected labels from HTML editor export
+with zipfile.ZipFile("yolo_labels_corrected.zip", 'r') as z:
+    for name in z.namelist():
+        fname = os.path.basename(name)
+        if fname.endswith('.txt') and 'classes' not in fname.lower():
+            z.extract(name, "./temp")
+            shutil.move(f"./temp/{name}", f"dataset/labels/train_with_external/{fname}")
+
+if os.path.exists("./temp"):
+    shutil.rmtree("./temp")
+
+print(f"Images: {len(os.listdir('dataset/images/train_with_external'))}")
+print(f"Labels: {len(os.listdir('dataset/labels/train_with_external'))}")
