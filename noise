@@ -1,0 +1,83 @@
+import os
+import cv2
+import numpy as np
+import shutil
+import yaml
+from pathlib import Path
+
+# Copy entire train to new folder
+if os.path.exists("dataset/images/train_with_noise"):
+    shutil.rmtree("dataset/images/train_with_noise")
+if os.path.exists("dataset/labels/train_with_noise"):
+    shutil.rmtree("dataset/labels/train_with_noise")
+
+shutil.copytree("dataset/images/train", "dataset/images/train_with_noise")
+shutil.copytree("dataset/labels/train", "dataset/labels/train_with_noise")
+
+train_images = "dataset/images/train_with_noise"
+train_labels = "dataset/labels/train_with_noise"
+
+np.random.seed(42)
+
+soldier_count = 0
+civilian_count = 0
+
+for f in os.listdir(train_labels):
+    if not f.endswith('.txt') or '_noise' in f:
+        continue
+    
+    has_close_soldier = False
+    has_close_civilian = False
+    
+    with open(f"{train_labels}/{f}") as fh:
+        for line in fh:
+            parts = line.strip().split()
+            if len(parts) >= 5 and float(parts[4]) > 0.1:
+                if parts[0] == '0':
+                    has_close_soldier = True
+                elif parts[0] == '2':
+                    has_close_civilian = True
+    
+    if not has_close_soldier and not has_close_civilian:
+        continue
+    
+    base = Path(f).stem
+    for ext in ['.jpg', '.jpeg', '.png']:
+        img_path = f"{train_images}/{base}{ext}"
+        if not os.path.exists(img_path):
+            continue
+        
+        img = cv2.imread(img_path)
+        if img is None:
+            continue
+        
+        # Noisy version
+        noise = np.random.normal(0, 15, img.shape).astype(np.int16)
+        noisy = np.clip(img.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+        cv2.imwrite(f"{train_images}/{base}_noise{ext}", noisy)
+        shutil.copy2(f"{train_labels}/{f}", f"{train_labels}/{base}_noise.txt")
+        
+        if has_close_soldier:
+            soldier_count += 1
+        if has_close_civilian:
+            civilian_count += 1
+        
+        break
+
+# Create yaml
+data = {
+    'path': os.path.abspath("dataset"),
+    'train': 'images/train_with_noise',
+    'val': 'images/val',
+    'test': 'images/test',
+    'nc': 3,
+    'names': ['soldier', 'barrier', 'civilian'],
+}
+
+with open("dataset/data_w_noise.yaml", 'w') as f:
+    yaml.dump(data, f, default_flow_style=False)
+
+print(f"Close-up soldier noisy copies: {soldier_count}")
+print(f"Close-up civilian noisy copies: {civilian_count}")
+print(f"Total training images: {len([f for f in os.listdir(train_images) if f.endswith(('.jpg','.jpeg','.png'))])}")
+print(f"Saved: dataset/data_w_noise.yaml")
