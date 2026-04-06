@@ -1,0 +1,124 @@
+from ultralytics import YOLO
+import cv2
+import numpy as np
+import os
+
+model = YOLO("runs/dashcam/YOUR_BEST_RUN/weights/best.pt")
+
+def sliced_inference(image_path, model, slice_size=640, overlap=0.2, conf=0.3):
+    img = cv2.imread(image_path)
+    img_h, img_w = img.shape[:2]
+    
+    step = int(slice_size * (1 - overlap))
+    all_boxes = []
+    all_scores = []
+    all_classes = []
+    
+    # Slide window across image
+    for y in range(0, img_h, step):
+        for x in range(0, img_w, step):
+            # Crop patch
+            x2 = min(x + slice_size, img_w)
+            y2 = min(y + slice_size, img_h)
+            x1 = max(0, x2 - slice_size)
+            y1 = max(0, y2 - slice_size)
+            
+            patch = img[y1:y2, x1:x2]
+            
+            # Run model on patch
+            results = model.predict(patch, conf=conf, verbose=False)
+            
+            # Convert box coords back to original image space
+            for box in results[0].boxes:
+                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                # Offset by patch position
+                bx1 += x1
+                by1 += y1
+                bx2 += x1
+                by2 += y1
+                all_boxes.append([bx1, by1, bx2, by2])
+                all_scores.append(float(box.conf[0]))
+                all_classes.append(int(box.cls[0]))
+    
+    # Also run on full image for large objects
+    results_full = model.predict(img, conf=conf, verbose=False)
+    for box in results_full[0].boxes:
+        all_boxes.append(box.xyxy[0].tolist())
+        all_scores.append(float(box.conf[0]))
+        all_classes.append(int(box.cls[0]))
+    
+    # NMS to merge overlapping detections
+    if len(all_boxes) == 0:
+        return img
+    
+    boxes_np = np.array(all_boxes)
+    scores_np = np.array(all_scores)
+    classes_np = np.array(all_classes)
+    
+    # Per-class NMS
+    keep = []
+    for cls in set(all_classes):
+        cls_mask = classes_np == cls
+        cls_boxes = boxes_np[cls_mask]
+        cls_scores = scores_np[cls_mask]
+        cls_indices = np.where(cls_mask)[0]
+        
+        # Simple NMS
+        order = cls_scores.argsort()[::-1]
+        suppressed = set()
+        for i in range(len(order)):
+            if order[i] in suppressed:
+                continue
+            keep.append(cls_indices[order[i]])
+            for j in range(i+1, len(order)):
+                if order[j] in suppressed:
+                    continue
+                # Calculate IoU
+                xx1 = max(cls_boxes[order[i]][0], cls_boxes[order[j]][0])
+                yy1 = max(cls_boxes[order[i]][1], cls_boxes[order[j]][1])
+                xx2 = min(cls_boxes[order[i]][2], cls_boxes[order[j]][2])
+                yy2 = min(cls_boxes[order[i]][3], cls_boxes[order[j]][3])
+                inter = max(0, xx2-xx1) * max(0, yy2-yy1)
+                area_i = (cls_boxes[order[i]][2]-cls_boxes[order[i]][0]) * (cls_boxes[order[i]][3]-cls_boxes[order[i]][1])
+                area_j = (cls_boxes[order[j]][2]-cls_boxes[order[j]][0]) * (cls_boxes[order[j]][3]-cls_boxes[order[j]][1])
+                iou = inter / (area_i + area_j - inter + 1e-6)
+                if iou > 0.5:
+                    suppressed.add(order[j])
+    
+    # Draw results
+    colors = {0: (0, 255, 0), 1: (0, 0, 255), 2: (255, 0, 0)}
+    names = {0: "soldier", 1: "barrier", 2: "civilian"}
+    result_img = img.copy()
+    
+    for idx in keep:
+        bx1, by1, bx2, by2 = [int(v) for v in all_boxes[idx]]
+        cls = all_classes[idx]
+        score = all_scores[idx]
+        color = colors.get(cls, (255, 255, 255))
+        cv2.rectangle(result_img, (bx1, by1), (bx2, by2), color, 2)
+        cv2.putText(result_img, f"{names.get(cls, '?')} {score:.2f}", 
+                    (bx1, by1-5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    
+    return result_img
+
+# Run on test images
+os.makedirs("sahi_results", exist_ok=True)
+test_dir = "dataset/images/test"
+
+for f in sorted(os.listdir(test_dir))[:10]:
+    if not f.endswith(('.jpg', '.png')):
+        continue
+    
+    # Normal inference
+    normal = model.predict(f"{test_dir}/{f}", conf=0.3, verbose=False)
+    normal_img = normal[0].plot()
+    
+    # Sliced inference
+    sliced_img = sliced_inference(f"{test_dir}/{f}", model, slice_size=640, overlap=0.2, conf=0.3)
+    
+    # Side by side
+    comparison = np.hstack([normal_img, sliced_img])
+    cv2.imwrite(f"sahi_results/{f}", comparison)
+    print(f"Saved: {f}")
+
+print("Done! Check sahi_results/ - left=normal, right=sliced")
