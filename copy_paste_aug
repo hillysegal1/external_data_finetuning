@@ -1,0 +1,454 @@
+"""
+Context-Aware Copy-Paste Augmentation for Soldier Detection
+=============================================================
+Crops soldier bounding boxes from clear training images,
+pastes them near barriers in other training images with:
+  - Scale matching (soldier size proportional to barrier size)
+  - Brightness matching (adjusts crop to match target lighting)
+  - Edge blending (Gaussian blur on borders)
+  - Position logic (near barriers, on the ground)
+
+Run in JupyterHub. Generates new training images + labels.
+
+YOUR CLASSES:
+  0 = soldier
+  1 = barrier
+  2 = civilian
+"""
+
+import os
+import cv2
+import numpy as np
+import random
+import shutil
+from pathlib import Path
+
+random.seed(42)
+np.random.seed(42)
+
+# ============================================================
+# CONFIG - EDIT THESE
+# ============================================================
+
+TRAIN_IMAGES = "dataset/images/train"
+TRAIN_LABELS = "dataset/labels/train"
+
+# Output folder for augmented images
+OUTPUT_IMAGES = "dataset/images/train_copypaste"
+OUTPUT_LABELS = "dataset/labels/train_copypaste"
+
+# How many augmented images to generate
+NUM_AUGMENTED = 200
+
+# Minimum soldier crop size (pixels) to be considered "clear"
+MIN_SOLDIER_HEIGHT = 40
+
+# Visualize examples
+SHOW_EXAMPLES = True
+NUM_EXAMPLES = 10
+EXAMPLES_DIR = "./copypaste_examples"
+
+# ============================================================
+# STEP 1: Parse all labels
+# ============================================================
+
+def parse_yolo_labels(label_path):
+    """Parse YOLO format label file."""
+    boxes = []
+    if not os.path.exists(label_path):
+        return boxes
+    with open(label_path) as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 5:
+                cls = int(parts[0])
+                cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                boxes.append({'cls': cls, 'cx': cx, 'cy': cy, 'w': w, 'h': h})
+    return boxes
+
+def yolo_to_pixel(box, img_w, img_h):
+    """Convert YOLO normalized coords to pixel coords."""
+    cx, cy, w, h = box['cx'], box['cy'], box['w'], box['h']
+    x1 = int((cx - w/2) * img_w)
+    y1 = int((cy - h/2) * img_h)
+    x2 = int((cx + w/2) * img_w)
+    y2 = int((cy + h/2) * img_h)
+    return max(0, x1), max(0, y1), min(img_w, x2), min(img_h, y2)
+
+def pixel_to_yolo(x1, y1, x2, y2, img_w, img_h):
+    """Convert pixel coords to YOLO normalized coords."""
+    cx = ((x1 + x2) / 2) / img_w
+    cy = ((y1 + y2) / 2) / img_h
+    w = (x2 - x1) / img_w
+    h = (y2 - y1) / img_h
+    return cx, cy, w, h
+
+# ============================================================
+# STEP 2: Build soldier crop library
+# ============================================================
+
+print("STEP 1: Building soldier crop library...")
+
+soldier_crops = []  # list of {'crop': np.array, 'brightness': float, 'aspect_ratio': float}
+
+for img_file in os.listdir(TRAIN_IMAGES):
+    if not img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+        continue
+    
+    base = Path(img_file).stem
+    label_path = f"{TRAIN_LABELS}/{base}.txt"
+    img_path = f"{TRAIN_IMAGES}/{img_file}"
+    
+    boxes = parse_yolo_labels(label_path)
+    soldiers = [b for b in boxes if b['cls'] == 0]
+    
+    if not soldiers:
+        continue
+    
+    img = cv2.imread(img_path)
+    if img is None:
+        continue
+    
+    img_h, img_w = img.shape[:2]
+    
+    for s in soldiers:
+        x1, y1, x2, y2 = yolo_to_pixel(s, img_w, img_h)
+        crop_h = y2 - y1
+        crop_w = x2 - x1
+        
+        if crop_h < MIN_SOLDIER_HEIGHT or crop_w < 5:
+            continue
+        
+        crop = img[y1:y2, x1:x2].copy()
+        
+        if crop.size == 0:
+            continue
+        
+        brightness = np.mean(crop)
+        aspect_ratio = crop_h / max(crop_w, 1)
+        
+        soldier_crops.append({
+            'crop': crop,
+            'brightness': brightness,
+            'aspect_ratio': aspect_ratio,
+            'source': img_file,
+            'height': crop_h,
+        })
+
+print(f"  Found {len(soldier_crops)} clear soldier crops (>={MIN_SOLDIER_HEIGHT}px)")
+
+if len(soldier_crops) == 0:
+    print("  ERROR: No soldier crops found! Lower MIN_SOLDIER_HEIGHT and retry.")
+    raise SystemExit
+
+# Show crop size distribution
+heights = [c['height'] for c in soldier_crops]
+print(f"  Crop heights: min={min(heights)}, max={max(heights)}, mean={np.mean(heights):.0f}")
+
+# ============================================================
+# STEP 3: Find target images (have barriers, few/no soldiers)
+# ============================================================
+
+print("\nSTEP 2: Finding target images (barriers or civilians, few soldiers)...")
+
+target_images = []
+
+for img_file in os.listdir(TRAIN_IMAGES):
+    if not img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+        continue
+    
+    base = Path(img_file).stem
+    label_path = f"{TRAIN_LABELS}/{base}.txt"
+    
+    boxes = parse_yolo_labels(label_path)
+    barriers = [b for b in boxes if b['cls'] == 1]
+    soldiers = [b for b in boxes if b['cls'] == 0]
+    civilians = [b for b in boxes if b['cls'] == 2]
+    
+    # Want images with barriers OR civilians, but few soldiers
+    if (len(barriers) > 0 or len(civilians) > 0) and len(soldiers) <= 1:
+        target_images.append({
+            'file': img_file,
+            'barriers': barriers,
+            'civilians': civilians,
+            'existing_boxes': boxes,
+        })
+
+near_barrier_count = sum(1 for t in target_images if len(t['barriers']) > 0)
+near_civilian_count = sum(1 for t in target_images if len(t['civilians']) > 0)
+print(f"  Found {len(target_images)} target images")
+print(f"    With barriers: {near_barrier_count}")
+print(f"    With civilians: {near_civilian_count}")
+
+if len(target_images) == 0:
+    print("  ERROR: No target images found!")
+    raise SystemExit
+
+# ============================================================
+# STEP 4: Context-aware pasting
+# ============================================================
+
+print(f"\nSTEP 3: Generating {NUM_AUGMENTED} augmented images...")
+
+os.makedirs(OUTPUT_IMAGES, exist_ok=True)
+os.makedirs(OUTPUT_LABELS, exist_ok=True)
+
+if SHOW_EXAMPLES:
+    os.makedirs(EXAMPLES_DIR, exist_ok=True)
+
+def match_brightness(crop, target_brightness):
+    """Adjust crop brightness to match target image region."""
+    crop_brightness = np.mean(crop)
+    if crop_brightness == 0:
+        return crop
+    ratio = target_brightness / crop_brightness
+    ratio = np.clip(ratio, 0.5, 2.0)  # don't go too extreme
+    adjusted = np.clip(crop.astype(np.float32) * ratio, 0, 255).astype(np.uint8)
+    return adjusted
+
+def blend_edges(img, x1, y1, x2, y2, blur_radius=5):
+    """Blur the edges of the pasted region for smoother blending."""
+    # Create a mask
+    mask = np.zeros(img.shape[:2], dtype=np.float32)
+    mask[y1:y2, x1:x2] = 1.0
+    
+    # Blur the mask edges
+    mask = cv2.GaussianBlur(mask, (blur_radius*2+1, blur_radius*2+1), blur_radius)
+    
+    return mask
+
+def check_overlap(new_box, existing_boxes, img_w, img_h, threshold=0.3):
+    """Check if new box overlaps too much with existing boxes."""
+    nx1, ny1, nx2, ny2 = new_box
+    
+    for box in existing_boxes:
+        ex1, ey1, ex2, ey2 = yolo_to_pixel(box, img_w, img_h)
+        
+        # Calculate intersection
+        ix1 = max(nx1, ex1)
+        iy1 = max(ny1, ey1)
+        ix2 = min(nx2, ex2)
+        iy2 = min(ny2, ey2)
+        
+        if ix1 < ix2 and iy1 < iy2:
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            new_area = (nx2 - nx1) * (ny2 - ny1)
+            if intersection / max(new_area, 1) > threshold:
+                return True
+    
+    return False
+
+augmented_count = 0
+example_count = 0
+near_barrier_pastes = 0
+near_civilian_pastes = 0
+
+for i in range(NUM_AUGMENTED * 3):  # try more times to account for failures
+    if augmented_count >= NUM_AUGMENTED:
+        break
+    
+    # Pick random target image
+    target = random.choice(target_images)
+    img_path = f"{TRAIN_IMAGES}/{target['file']}"
+    img = cv2.imread(img_path)
+    if img is None:
+        continue
+    
+    img_h, img_w = img.shape[:2]
+    aug_img = img.copy()
+    
+    # Pick a random anchor to paste near (barrier OR civilian)
+    anchor_boxes = target['barriers'] + target.get('civilians', [])
+    
+    if not anchor_boxes:
+        continue
+    
+    anchor = random.choice(anchor_boxes)
+    anchor_type = "barrier" if anchor['cls'] == 1 else "civilian"
+    ax1, ay1, ax2, ay2 = yolo_to_pixel(anchor, img_w, img_h)
+    anchor_h = ay2 - ay1
+    anchor_w = ax2 - ax1
+    anchor_center_x = (ax1 + ax2) // 2
+    anchor_bottom_y = ay2
+    
+    # Pick a random soldier crop
+    soldier = random.choice(soldier_crops)
+    crop = soldier['crop'].copy()
+    
+    # Scale soldier relative to anchor
+    if anchor_type == "barrier":
+        # Soldier should be roughly 1.0-2.5x barrier height
+        scale_factor = random.uniform(1.0, 2.5)
+    else:
+        # Near civilian: soldier should be similar size to the civilian
+        scale_factor = random.uniform(0.8, 1.3)
+    
+    target_soldier_h = int(anchor_h * scale_factor)
+    target_soldier_h = max(15, min(target_soldier_h, img_h // 3))  # clamp
+    
+    # Maintain aspect ratio
+    orig_h, orig_w = crop.shape[:2]
+    aspect = orig_w / max(orig_h, 1)
+    target_soldier_w = int(target_soldier_h * aspect)
+    target_soldier_w = max(10, min(target_soldier_w, img_w // 4))
+    
+    # Resize crop
+    crop_resized = cv2.resize(crop, (target_soldier_w, target_soldier_h))
+    
+    # Position: near the anchor, on the ground
+    # X: within 200px left or right of anchor center
+    offset_x = random.randint(-200, 200)
+    paste_center_x = anchor_center_x + offset_x
+    paste_x1 = paste_center_x - target_soldier_w // 2
+    
+    # Y: feet at similar level to anchor bottom
+    offset_y = random.randint(-30, 30)
+    paste_y2 = anchor_bottom_y + offset_y
+    paste_y1 = paste_y2 - target_soldier_h
+    
+    # Boundary checks
+    paste_x1 = max(0, paste_x1)
+    paste_y1 = max(0, paste_y1)
+    paste_x2 = min(img_w, paste_x1 + target_soldier_w)
+    paste_y2 = min(img_h, paste_y1 + target_soldier_h)
+    
+    actual_w = paste_x2 - paste_x1
+    actual_h = paste_y2 - paste_y1
+    
+    if actual_w < 10 or actual_h < 15:
+        continue
+    
+    # Check overlap with existing boxes
+    if check_overlap((paste_x1, paste_y1, paste_x2, paste_y2), 
+                      target['existing_boxes'], img_w, img_h):
+        continue
+    
+    # Resize crop to actual dimensions (in case boundary clipped it)
+    crop_final = cv2.resize(crop_resized, (actual_w, actual_h))
+    
+    # Match brightness
+    target_region = aug_img[paste_y1:paste_y2, paste_x1:paste_x2]
+    if target_region.size > 0:
+        target_brightness = np.mean(target_region)
+        crop_final = match_brightness(crop_final, target_brightness)
+    
+    # Paste with edge blending
+    # Create alpha mask - full opacity in center, fading at edges
+    alpha = np.ones((actual_h, actual_w), dtype=np.float32)
+    border = max(2, min(actual_w, actual_h) // 6)
+    for b in range(border):
+        fade = (b + 1) / border
+        alpha[b, :] *= fade          # top
+        alpha[-(b+1), :] *= fade     # bottom
+        alpha[:, b] *= fade           # left
+        alpha[:, -(b+1)] *= fade     # right
+    
+    alpha_3ch = np.stack([alpha]*3, axis=-1)
+    
+    # Blend
+    aug_img[paste_y1:paste_y2, paste_x1:paste_x2] = (
+        crop_final * alpha_3ch + 
+        aug_img[paste_y1:paste_y2, paste_x1:paste_x2] * (1 - alpha_3ch)
+    ).astype(np.uint8)
+    
+    # Create new label file
+    new_boxes = list(target['existing_boxes'])  # copy existing
+    
+    # Add new soldier box
+    cx, cy, w, h = pixel_to_yolo(paste_x1, paste_y1, paste_x2, paste_y2, img_w, img_h)
+    new_boxes.append({'cls': 0, 'cx': cx, 'cy': cy, 'w': w, 'h': h})
+    
+    # Save augmented image
+    aug_name = f"copypaste_{augmented_count:04d}"
+    base_ext = Path(target['file']).suffix
+    cv2.imwrite(f"{OUTPUT_IMAGES}/{aug_name}{base_ext}", aug_img)
+    
+    # Save label
+    with open(f"{OUTPUT_LABELS}/{aug_name}.txt", 'w') as f:
+        for box in new_boxes:
+            f.write(f"{box['cls']} {box['cx']:.6f} {box['cy']:.6f} {box['w']:.6f} {box['h']:.6f}\n")
+    
+    # Save examples for visualization
+    if SHOW_EXAMPLES and example_count < NUM_EXAMPLES:
+        # Draw boxes on example
+        example_img = aug_img.copy()
+        
+        # Draw new soldier box in GREEN
+        cv2.rectangle(example_img, (paste_x1, paste_y1), (paste_x2, paste_y2), (0, 255, 0), 2)
+        cv2.putText(example_img, "PASTED SOLDIER", (paste_x1, paste_y1-5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # Draw anchor in RED (barrier) or BLUE (civilian)
+        if anchor_type == "barrier":
+            color = (0, 0, 255)
+            label = "BARRIER"
+        else:
+            color = (255, 0, 0)
+            label = "CIVILIAN"
+        cv2.rectangle(example_img, (ax1, ay1), (ax2, ay2), color, 2)
+        cv2.putText(example_img, label, (ax1, ay1-5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        
+        # Draw original image for comparison (side by side)
+        comparison = np.hstack([img, example_img])
+        cv2.imwrite(f"{EXAMPLES_DIR}/example_{example_count:02d}.jpg", comparison)
+        example_count += 1
+    
+    augmented_count += 1
+    if anchor_type == "barrier":
+        near_barrier_pastes += 1
+    else:
+        near_civilian_pastes += 1
+
+print(f"  Generated {augmented_count} augmented images")
+print(f"    Pasted near barriers: {near_barrier_pastes}")
+print(f"    Pasted near civilians: {near_civilian_pastes}")
+print(f"  Saved to: {OUTPUT_IMAGES}/")
+
+# ============================================================
+# STEP 5: Summary
+# ============================================================
+
+print(f"\n{'='*60}")
+print("SUMMARY")
+print(f"{'='*60}")
+print(f"Soldier crops found: {len(soldier_crops)}")
+print(f"Target images found: {len(target_images)}")
+print(f"Augmented images created: {augmented_count}")
+
+if SHOW_EXAMPLES:
+    print(f"Examples saved to: {EXAMPLES_DIR}/")
+    print(f"  Left side = original, Right side = with pasted soldier (green box)")
+
+# Count labels in augmented data
+aug_soldiers = 0
+aug_barriers = 0
+aug_civilians = 0
+for f in os.listdir(OUTPUT_LABELS):
+    if not f.endswith('.txt'):
+        continue
+    with open(f"{OUTPUT_LABELS}/{f}") as fh:
+        for line in fh:
+            cls = line.strip().split()[0]
+            if cls == '0': aug_soldiers += 1
+            elif cls == '1': aug_barriers += 1
+            elif cls == '2': aug_civilians += 1
+
+print(f"\nAugmented data labels:")
+print(f"  Soldiers: {aug_soldiers} (all pasted)")
+print(f"  Barriers: {aug_barriers} (from original images)")
+print(f"  Civilians: {aug_civilians} (from original images)")
+
+print(f"""
+NEXT STEPS:
+  1. Check examples in {EXAMPLES_DIR}/ - do the pasted soldiers look reasonable?
+  2. If yes, copy augmented data to training set:
+  
+     import shutil, os
+     for f in os.listdir("{OUTPUT_IMAGES}"):
+         shutil.copy2(f"{OUTPUT_IMAGES}/{{f}}", f"{TRAIN_IMAGES}/{{f}}")
+     for f in os.listdir("{OUTPUT_LABELS}"):
+         shutil.copy2(f"{OUTPUT_LABELS}/{{f}}", f"{TRAIN_LABELS}/{{f}}")
+     
+  3. Retrain with the expanded dataset
+""")
