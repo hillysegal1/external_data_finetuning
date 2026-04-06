@@ -1,0 +1,38 @@
+!pip install sahi
+
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction, get_prediction
+import os
+
+model = AutoDetectionModel.from_pretrained(
+    model_type="yolov8",
+    model_path="runs/dashcam/YOUR_BEST_X_RUN/weights/best.pt",
+    confidence_threshold=0.3,
+    device="cuda:0",
+)
+
+# Pick a few hard test images
+test_dir = "dataset/images/test"
+test_images = [f for f in os.listdir(test_dir) if f.endswith(('.jpg', '.png'))][:10]
+
+os.makedirs("sahi_comparison", exist_ok=True)
+
+for img_name in test_images:
+    img_path = f"{test_dir}/{img_name}"
+    
+    # Normal inference
+    normal = get_prediction(img_path, model)
+    normal.export_visuals(export_dir=f"sahi_comparison/normal_{img_name}/")
+    
+    # SAHI sliced inference
+    sliced = get_sliced_prediction(
+        img_path,
+        model,
+        slice_height=640,
+        slice_width=640,
+        overlap_height_ratio=0.2,
+        overlap_width_ratio=0.2,
+    )
+    sliced.export_visuals(export_dir=f"sahi_comparison/sliced_{img_name}/")
+
+print("Done! Compare normal vs sliced results in sahi_comparison/")
