@@ -1,0 +1,69 @@
+import os
+import cv2
+from pathlib import Path
+
+os.makedirs("close_up_soldiers", exist_ok=True)
+os.makedirs("close_up_civilians", exist_ok=True)
+
+train_images = "dataset/images/train"
+train_labels = "dataset/labels/train"
+
+s_count = 0
+c_count = 0
+
+for f in os.listdir(train_labels):
+    if not f.endswith('.txt'):
+        continue
+    
+    base = Path(f).stem
+    
+    # Find image
+    img_path = None
+    for ext in ['.jpg', '.jpeg', '.png']:
+        p = f"{train_images}/{base}{ext}"
+        if os.path.exists(p):
+            img_path = p
+            break
+    
+    if not img_path:
+        continue
+    
+    img = cv2.imread(img_path)
+    if img is None:
+        continue
+    
+    img_h, img_w = img.shape[:2]
+    
+    with open(f"{train_labels}/{f}") as fh:
+        for line in fh:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            
+            cls = parts[0]
+            cx, cy, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+            
+            if h < 0.1:
+                continue
+            
+            x1 = int((cx - w/2) * img_w)
+            y1 = int((cy - h/2) * img_h)
+            x2 = int((cx + w/2) * img_w)
+            y2 = int((cy + h/2) * img_h)
+            
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(img_w, x2), min(img_h, y2)
+            
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                continue
+            
+            if cls == '0':
+                cv2.imwrite(f"close_up_soldiers/soldier_{s_count:04d}.jpg", crop)
+                s_count += 1
+            elif cls == '2':
+                cv2.imwrite(f"close_up_civilians/civ_{c_count:04d}.jpg", crop)
+                c_count += 1
+
+print(f"Saved {s_count} close-up soldiers")
+print(f"Saved {c_count} close-up civilians")
