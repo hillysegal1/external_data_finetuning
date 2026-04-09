@@ -1,0 +1,43 @@
+import os
+import shutil
+import yaml
+
+base = "dataset"
+splits = {"train": "train_no_civ", "val": "val_no_civ", "test": "test_no_civ"}
+
+for src_split, dst_split in splits.items():
+    src_img = f"{base}/images/{src_split}"
+    src_lbl = f"{base}/labels/{src_split}"
+    dst_img = f"{base}/images/{dst_split}"
+    dst_lbl = f"{base}/labels/{dst_split}"
+
+    os.makedirs(dst_img, exist_ok=True)
+    os.makedirs(dst_lbl, exist_ok=True)
+
+    # Copy images as-is
+    for f in os.listdir(src_img):
+        shutil.copy(f"{src_img}/{f}", f"{dst_img}/{f}")
+
+    # Copy labels, stripping civilian (class 2) lines
+    for f in os.listdir(src_lbl):
+        with open(f"{src_lbl}/{f}") as file:
+            lines = file.readlines()
+        filtered = [l for l in lines if not l.startswith("2 ")]
+        with open(f"{dst_lbl}/{f}", "w") as file:
+            file.writelines(filtered)
+
+    print(f"{dst_split}: {len(os.listdir(dst_img))} images, {len(os.listdir(dst_lbl))} labels")
+
+data = {
+    'path': os.path.abspath(base),
+    'train': 'images/train_no_civ',
+    'val': 'images/val_no_civ',
+    'test': 'images/test_no_civ',
+    'nc': 2,
+    'names': ['soldier', 'barrier'],
+}
+
+with open(f"{base}/data_no_civ.yaml", 'w') as f:
+    yaml.dump(data, f, default_flow_style=False)
+
+print("Done. Saved: dataset/data_no_civ.yaml")
