@@ -1,0 +1,317 @@
+"""
+5-Fold Cross Validation for YOLO Checkpoint Detection
+======================================================
+Usage:
+    1. Set DATA_YAML to your dataset yaml path
+    2. Set WEIGHTS to your model weights
+    3. Set PROJECT_NAME to identify this run
+    4. Run the script
+
+Splits BY VIDEO to prevent data leakage.
+Run once with no-noise yaml, once with noise yaml, compare results.
+"""
+
+import os
+import shutil
+import yaml
+import numpy as np
+import json
+from pathlib import Path
+from collections import defaultdict
+from ultralytics import YOLO
+
+# ============================================================
+# CONFIG - EDIT THESE
+# ============================================================
+
+DATA_YAML = "dataset/data.yaml"           # change to data_w_noise.yaml for noise run
+WEIGHTS = "yolo11x.pt"                     # or path to your best.pt
+K_FOLDS = 5
+EPOCHS = 60
+PATIENCE = 20
+PROJECT_NAME = "runs/kfold_no_noise"       # change to kfold_with_noise for noise run
+
+# ============================================================
+# STEP 1: Load yaml and collect all data
+# ============================================================
+
+print(f"Loading: {DATA_YAML}")
+with open(DATA_YAML) as f:
+    data_cfg = yaml.safe_load(f)
+
+base_path = data_cfg.get('path', os.path.dirname(DATA_YAML))
+train_img_dir = os.path.join(base_path, data_cfg['train'])
+train_lbl_dir = train_img_dir.replace('images', 'labels')
+val_img_dir = os.path.join(base_path, data_cfg['val'])
+val_lbl_dir = val_img_dir.replace('images', 'labels')
+class_names = data_cfg['names']
+nc = data_cfg['nc']
+
+print(f"Classes: {class_names}")
+print(f"Train: {train_img_dir}")
+print(f"Val: {val_img_dir}")
+
+# ============================================================
+# STEP 2: Group all images by video
+# ============================================================
+
+print("\nGrouping images by video...")
+
+video_images = defaultdict(list)
+
+def collect_from_dir(img_dir, lbl_dir):
+    if not os.path.exists(img_dir):
+        print(f"  WARNING: {img_dir} not found, skipping")
+        return
+    for img_file in os.listdir(img_dir):
+        if not img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+            continue
+        
+        base = Path(img_file).stem
+        label_file = base + ".txt"
+        label_path = os.path.join(lbl_dir, label_file)
+        
+        # Extract video name
+        parts = base.split('_')
+        video_name = "unknown"
+        for i, p in enumerate(parts):
+            if p == 'vid' and i + 1 < len(parts):
+                video_name = f"vid_{parts[i+1]}"
+                break
+        
+        video_images[video_name].append({
+            'img_src': os.path.join(img_dir, img_file),
+            'lbl_src': label_path if os.path.exists(label_path) else None,
+            'img_name': img_file,
+            'lbl_name': label_file,
+        })
+
+collect_from_dir(train_img_dir, train_lbl_dir)
+collect_from_dir(val_img_dir, val_lbl_dir)
+
+total_images = sum(len(v) for v in video_images.values())
+print(f"Found {len(video_images)} videos, {total_images} total images")
+
+for vid in sorted(video_images.keys()):
+    s, b, c = 0, 0, 0
+    for item in video_images[vid]:
+        if item['lbl_src'] and os.path.exists(item['lbl_src']):
+            with open(item['lbl_src']) as f:
+                for line in f:
+                    cls = line.strip().split()[0] if line.strip() else None
+                    if cls == '0': s += 1
+                    elif cls == '1': b += 1
+                    elif cls == '2': c += 1
+    print(f"  {vid}: {len(video_images[vid])} frames, S={s} B={b} C={c}")
+
+# ============================================================
+# STEP 3: Create 5 folds
+# ============================================================
+
+print(f"\nCreating {K_FOLDS} folds...")
+
+video_names = sorted(video_images.keys())
+np.random.seed(42)
+np.random.shuffle(video_names)
+
+folds = [[] for _ in range(K_FOLDS)]
+for i, vid in enumerate(video_names):
+    folds[i % K_FOLDS].append(vid)
+
+for i, fold in enumerate(folds):
+    frames = sum(len(video_images[v]) for v in fold)
+    print(f"  Fold {i}: {len(fold)} videos, {frames} frames - {fold}")
+
+# ============================================================
+# STEP 4: Build fold directories + yamls
+# ============================================================
+
+print("\nBuilding fold directories...")
+
+KFOLD_DIR = os.path.join(base_path, "kfold")
+if os.path.exists(KFOLD_DIR):
+    shutil.rmtree(KFOLD_DIR)
+
+ds_yamls = []
+
+for k in range(K_FOLDS):
+    val_videos = set(folds[k])
+    
+    fold_dir = os.path.join(KFOLD_DIR, f"fold_{k}")
+    for split in ['train', 'val']:
+        os.makedirs(os.path.join(fold_dir, 'images', split), exist_ok=True)
+        os.makedirs(os.path.join(fold_dir, 'labels', split), exist_ok=True)
+    
+    train_count = 0
+    val_count = 0
+    
+    for vid, items in video_images.items():
+        split = 'val' if vid in val_videos else 'train'
+        
+        for item in items:
+            dst_img = os.path.join(fold_dir, 'images', split, item['img_name'])
+            dst_lbl = os.path.join(fold_dir, 'labels', split, item['lbl_name'])
+            
+            shutil.copy2(item['img_src'], dst_img)
+            if item['lbl_src'] and os.path.exists(item['lbl_src']):
+                shutil.copy2(item['lbl_src'], dst_lbl)
+            else:
+                open(dst_lbl, 'w').close()
+            
+            if split == 'train':
+                train_count += 1
+            else:
+                val_count += 1
+    
+    fold_yaml = {
+        'path': os.path.abspath(fold_dir),
+        'train': 'images/train',
+        'val': 'images/val',
+        'nc': nc,
+        'names': class_names,
+    }
+    
+    yaml_path = os.path.join(fold_dir, 'data.yaml')
+    with open(yaml_path, 'w') as f:
+        yaml.dump(fold_yaml, f, default_flow_style=False)
+    
+    ds_yamls.append(yaml_path)
+    print(f"  Fold {k}: train={train_count}, val={val_count}")
+
+# ============================================================
+# STEP 5: Train all folds
+# ============================================================
+
+print(f"\n{'='*60}")
+print(f"TRAINING {K_FOLDS} FOLDS")
+print(f"Weights: {WEIGHTS}")
+print(f"Data: {DATA_YAML}")
+print(f"{'='*60}")
+
+results = {}
+
+for k in range(K_FOLDS):
+    print(f"\n{'='*40}")
+    print(f"FOLD {k+1}/{K_FOLDS}")
+    print(f"Val videos: {folds[k]}")
+    print(f"{'='*40}")
+    
+    # Fresh model each fold
+    model = YOLO(WEIGHTS)
+    
+    model.train(
+        data=ds_yamls[k],
+        epochs=EPOCHS,
+        imgsz=1280,
+        batch=-1,
+        amp=True,
+        device=0,
+        patience=PATIENCE,
+        
+        freeze=5,
+        optimizer="auto",
+        lr0=0.0005,
+        lrf=0.01,
+        cos_lr=True,
+        weight_decay=0.0005,
+        warmup_epochs=5,
+        
+        hsv_h=0.015,
+        hsv_s=0.7,
+        hsv_v=0.5,
+        translate=0.1,
+        scale=0.5,
+        fliplr=0.5,
+        mosaic=1.0,
+        mixup=0.15,
+        erasing=0.3,
+        close_mosaic=10,
+        
+        project=PROJECT_NAME,
+        name=f"fold_{k}",
+    )
+    
+    # Evaluate
+    metrics = model.val(data=ds_yamls[k])
+    
+    results[k] = {
+        'mAP50': float(metrics.box.map50),
+        'per_class': {}
+    }
+    
+    for i, name in enumerate(class_names):
+        if i < len(metrics.box.maps):
+            results[k]['per_class'][name] = float(metrics.box.maps[i])
+        else:
+            results[k]['per_class'][name] = 0.0
+    
+    print(f"\nFold {k} results:")
+    print(f"  mAP50: {results[k]['mAP50']:.3f}")
+    for name, val in results[k]['per_class'].items():
+        print(f"  {name}: {val:.3f}")
+
+# ============================================================
+# STEP 6: Summary
+# ============================================================
+
+print(f"\n{'='*60}")
+print(f"CROSS VALIDATION RESULTS ({K_FOLDS} FOLDS)")
+print(f"Data: {DATA_YAML}")
+print(f"Weights: {WEIGHTS}")
+print(f"{'='*60}")
+
+header = f"{'Fold':<8} {'mAP50':<10}"
+for name in class_names:
+    header += f" {name:<12}"
+print(header)
+
+for k in range(K_FOLDS):
+    row = f"{k:<8} {results[k]['mAP50']:<10.3f}"
+    for name in class_names:
+        row += f" {results[k]['per_class'].get(name, 0):<12.3f}"
+    print(row)
+
+# Average and std
+avg_map = np.mean([r['mAP50'] for r in results.values()])
+std_map = np.std([r['mAP50'] for r in results.values()])
+
+row_avg = f"{'AVG':<8} {avg_map:<10.3f}"
+row_std = f"{'STD':<8} {std_map:<10.3f}"
+
+for name in class_names:
+    vals = [r['per_class'].get(name, 0) for r in results.values()]
+    row_avg += f" {np.mean(vals):<12.3f}"
+    row_std += f" {np.std(vals):<12.3f}"
+
+print("-" * (8 + 10 + 12 * len(class_names)))
+print(row_avg)
+print(row_std)
+
+print(f"""
+INTERPRETATION:
+  AVG = your model's true expected performance
+  STD = how much it varies by split
+  
+  Low STD (<0.03): consistent, reliable
+  High STD (>0.05): unstable, depends on which videos are in val
+  
+  To compare noise vs no-noise:
+    Run 1: DATA_YAML = "dataset/data.yaml", PROJECT_NAME = "runs/kfold_no_noise"
+    Run 2: DATA_YAML = "dataset/data_w_noise.yaml", PROJECT_NAME = "runs/kfold_with_noise"
+    Compare the AVG rows
+""")
+
+# Save results
+results_path = os.path.join(PROJECT_NAME, "cv_results.json")
+os.makedirs(PROJECT_NAME, exist_ok=True)
+with open(results_path, 'w') as f:
+    json.dump({
+        'data_yaml': DATA_YAML,
+        'weights': WEIGHTS,
+        'k_folds': K_FOLDS,
+        'epochs': EPOCHS,
+        'results': {str(k): v for k, v in results.items()},
+        'avg_mAP50': float(avg_map),
+        'std_mAP50': float(std_map),
+    }, f, indent=2)
+print(f"Results saved to: {results_path}")
