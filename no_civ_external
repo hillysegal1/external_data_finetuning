@@ -1,0 +1,51 @@
+import os
+import shutil
+from pathlib import Path
+
+src_img = "dataset/images/train_with_external"
+src_lbl = "dataset/labels/train_with_external"
+dst_img = "dataset/images/train_external_nociv"
+dst_lbl = "dataset/labels/train_external_nociv"
+
+os.makedirs(dst_img, exist_ok=True)
+os.makedirs(dst_lbl, exist_ok=True)
+
+kept = 0
+skipped = 0
+
+for lbl_file in os.listdir(src_lbl):
+    if not lbl_file.endswith('.txt'):
+        continue
+
+    stem = Path(lbl_file).stem
+    lbl_path = f"{src_lbl}/{lbl_file}"
+
+    with open(lbl_path) as f:
+        lines = [l.strip().split() for l in f if l.strip()]
+
+    # Drop civilian only lines, keep anything with soldier or barrier
+    filtered = [l for l in lines if l[0] != '2']
+    
+    if not filtered:
+        skipped += 1
+        continue
+
+    img_path = None
+    for ext in ['.jpg', '.jpeg', '.png']:
+        p = f"{src_img}/{stem}{ext}"
+        if os.path.exists(p):
+            img_path = p
+            break
+    if not img_path:
+        continue
+
+    shutil.copy(img_path, f"{dst_img}/{stem}{Path(img_path).suffix}")
+
+    with open(f"{dst_lbl}/{lbl_file}", 'w') as f:
+        for l in filtered:
+            f.write(' '.join(l) + '\n')
+
+    kept += 1
+
+print(f"Kept {kept} images")
+print(f"Skipped {skipped} images that only had civilian labels")
