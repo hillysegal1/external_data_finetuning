@@ -11,23 +11,27 @@ os.makedirs(dst_img, exist_ok=True)
 os.makedirs(dst_lbl, exist_ok=True)
 
 kept = 0
-skipped = 0
+skipped_civ_only = 0
+skipped_no_img = 0
 
 for lbl_file in os.listdir(src_lbl):
     if not lbl_file.endswith('.txt'):
         continue
 
     stem = Path(lbl_file).stem
-    lbl_path = f"{src_lbl}/{lbl_file}"
 
-    with open(lbl_path) as f:
+    # Only process external data
+    if not stem.startswith('bdd_'):
+        continue
+
+    with open(f"{src_lbl}/{lbl_file}") as f:
         lines = [l.strip().split() for l in f if l.strip()]
 
-    # Drop civilian only lines, keep anything with soldier or barrier
+    # Drop civilian lines
     filtered = [l for l in lines if l[0] != '2']
-    
+
     if not filtered:
-        skipped += 1
+        skipped_civ_only += 1
         continue
 
     img_path = None
@@ -37,6 +41,7 @@ for lbl_file in os.listdir(src_lbl):
             img_path = p
             break
     if not img_path:
+        skipped_no_img += 1
         continue
 
     shutil.copy(img_path, f"{dst_img}/{stem}{Path(img_path).suffix}")
@@ -47,5 +52,6 @@ for lbl_file in os.listdir(src_lbl):
 
     kept += 1
 
-print(f"Kept {kept} images")
-print(f"Skipped {skipped} images that only had civilian labels")
+print(f"Kept {kept} external images")
+print(f"Skipped {skipped_civ_only} civilian-only images")
+print(f"Skipped {skipped_no_img} missing images")
