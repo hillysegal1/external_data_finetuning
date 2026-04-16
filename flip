@@ -1,0 +1,27 @@
+import cv2
+
+cap = cv2.VideoCapture("your_video.mp4")
+fps = cap.get(cv2.CAP_PROP_FPS)
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+# Output dimensions are swapped
+out = cv2.VideoWriter(
+    "flipped_horizontal.mp4",
+    cv2.VideoWriter_fourcc(*"mp4v"),
+    fps,
+    (h, w)  # swapped — height becomes width
+)
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+    
+    # Rotate 90 degrees
+    rotated = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    out.write(rotated)
+
+cap.release()
+out.release()
+print("Done")
