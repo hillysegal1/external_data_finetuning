@@ -1,0 +1,63 @@
+import cv2
+from ultralytics import YOLO
+
+models = {
+    "3class_best": YOLO("runs/dashcam/YOUR_BEST_3CLASS/weights/best.pt"),
+    "3class_prev": YOLO("runs/dashcam/YOUR_PREV_3CLASS/weights/best.pt"),
+    "2class_best": YOLO("runs/dashcam/YOUR_BEST_2CLASS/weights/best.pt"),
+}
+
+video_path = "your_6min_video.mp4"
+cap = cv2.VideoCapture(video_path)
+fps = cap.get(cv2.CAP_PROP_FPS)
+w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+out = cv2.VideoWriter(
+    "comparison.mp4",
+    cv2.VideoWriter_fourcc(*"mp4v"),
+    fps,
+    (w * len(models), h)
+)
+
+COLORS = {
+    "soldier": (0, 255, 0),
+    "barrier": (255, 0, 0),
+    "civilian": (0, 165, 255),
+}
+
+def draw_predictions(frame, results, model_name):
+    annotated = frame.copy()
+    cv2.putText(annotated, model_name, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    for box in results[0].boxes:
+        cls_id = int(box.cls)
+        label = results[0].names[cls_id]
+        conf = float(box.conf)
+        x1, y1, x2, y2 = map(int, box.xyxy[0])
+        color = COLORS.get(label, (255, 255, 255))
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
+        cv2.putText(annotated, f"{label} {conf:.2f}", (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+    return annotated
+
+frame_idx = 0
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frames = []
+    for name, model in models.items():
+        results = model(frame, conf=0.25, verbose=False)
+        annotated = draw_predictions(frame, results, name)
+        frames.append(annotated)
+
+    out.write(cv2.hconcat(frames))
+    frame_idx += 1
+    if frame_idx % 100 == 0:
+        print(f"Processed {frame_idx} frames")
+
+cap.release()
+out.release()
+print(f"Done. {frame_idx} frames processed.")
