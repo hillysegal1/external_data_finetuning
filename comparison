@@ -1,44 +1,72 @@
 import cv2
+import os
+from pathlib import Path
 from ultralytics import YOLO
 
+# ---- CONFIG ----
+video_path = "your_video.mp4"
 models = {
     "3class_best": YOLO("runs/dashcam/YOUR_BEST_3CLASS/weights/best.pt"),
-    "3class_prev": YOLO("runs/dashcam/YOUR_PREV_3CLASS/weights/best.pt"),
     "2class_best": YOLO("runs/dashcam/YOUR_BEST_2CLASS/weights/best.pt"),
 }
+CONF = 0.25
+output_dir = "runs/inference/comparison_vids"
+# ----------------
 
-video_path = "your_6min_video.mp4"
+os.makedirs(output_dir, exist_ok=True)
+output_path = f"{output_dir}/comparison_{Path(video_path).stem}.mp4"
+
 cap = cv2.VideoCapture(video_path)
 fps = cap.get(cv2.CAP_PROP_FPS)
 w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
+panel_w = w // 2
+panel_h = h // 2
+
+print(f"Video: {w}x{h} @ {fps}fps")
+print(f"Panel size: {panel_w}x{panel_h}")
+print(f"Output: {os.path.abspath(output_path)}")
+
 out = cv2.VideoWriter(
-    "comparison.mp4",
+    output_path,
     cv2.VideoWriter_fourcc(*"mp4v"),
     fps,
-    (w * len(models), h)
+    (panel_w * len(models), panel_h)
 )
 
+if not out.isOpened():
+    print("ERROR: VideoWriter failed to open")
+    cap.release()
+    exit()
+
 COLORS = {
-    "soldier": (0, 255, 0),
-    "barrier": (255, 0, 0),
-    "civilian": (0, 165, 255),
+    "soldier":  (0, 255, 0),    # green
+    "barrier":  (255, 0, 0),    # blue
+    "civilian": (0, 165, 255),  # orange
 }
 
 def draw_predictions(frame, results, model_name):
-    annotated = frame.copy()
-    cv2.putText(annotated, model_name, (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+    annotated = cv2.resize(frame.copy(), (panel_w, panel_h))
+
+    cv2.putText(annotated, model_name, (10, 25),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
     for box in results[0].boxes:
         cls_id = int(box.cls)
         label = results[0].names[cls_id]
         conf = float(box.conf)
         x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+        # Scale boxes to match resized frame
+        x1, x2 = x1 // 2, x2 // 2
+        y1, y2 = y1 // 2, y2 // 2
+
         color = COLORS.get(label, (255, 255, 255))
         cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {conf:.2f}", (x1, y1 - 8),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        cv2.putText(annotated, f"{label} {conf:.2f}", (x1, max(y1 - 8, 10)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
     return annotated
 
 frame_idx = 0
@@ -47,17 +75,23 @@ while cap.isOpened():
     if not ret:
         break
 
-    frames = []
+    panels = []
     for name, model in models.items():
-        results = model(frame, conf=0.25, verbose=False)
-        annotated = draw_predictions(frame, results, name)
-        frames.append(annotated)
+        results = model(frame, conf=CONF, verbose=False)
+        panel = draw_predictions(frame, results, name)
+        panels.append(panel)
 
-    out.write(cv2.hconcat(frames))
+    combined = cv2.hconcat(panels)
+    out.write(combined)
+
     frame_idx += 1
     if frame_idx % 100 == 0:
         print(f"Processed {frame_idx} frames")
 
 cap.release()
 out.release()
+
 print(f"Done. {frame_idx} frames processed.")
+print(f"Saved to: {os.path.abspath(output_path)}")
+print(f"File exists: {os.path.exists(output_path)}")
+print(f"File size: {os.path.getsize(output_path)} bytes")
