@@ -1,0 +1,122 @@
+import os
+import pandas as pd
+from pathlib import Path
+
+# ---- CONFIG ----
+runs_dir = "runs/dashcam"
+category = "soldier"  # change to "barrier" or "civilian" or "all"
+top_n = 5             # how many top models to return per category
+# ----------------
+
+# Map category names to results.csv columns
+# YOLO logs per-class metrics in order of class index
+CLASS_MAP = {
+    "soldier":  "metrics/mAP50(B)",  # fallback to overall if per-class not available
+    "barrier":  "metrics/mAP50(B)",
+    "civilian": "metrics/mAP50(B)",
+    "all":      "metrics/mAP50(B)",
+}
+
+def get_class_map_from_results(results_csv, class_name):
+    """Try to extract per-class mAP from results if available."""
+    df = pd.read_csv(results_csv)
+    df.columns = df.columns.str.strip()
+    
+    # Check if per-class columns exist
+    per_class_cols = [c for c in df.columns if class_name.lower() in c.lower()]
+    
+    if per_class_cols:
+        col = per_class_cols[0]
+        best_val = df[col].max()
+        best_epoch = df[col].idxmax() + 1
+        return best_val, best_epoch, col
+    else:
+        # Fall back to overall mAP50
+        col = "metrics/mAP50(B)"
+        if col in df.columns:
+            best_val = df[col].max()
+            best_epoch = df[col].idxmax() + 1
+            return best_val, best_epoch, col
+        return None, None, None
+
+def find_best_weights(runs_dir, category, top_n):
+    results = []
+
+    for run_name in os.listdir(runs_dir):
+        run_path = Path(runs_dir) / run_name
+        results_csv = run_path / "results.csv"
+        weights_path = run_path / "weights" / "best.pt"
+
+        # Skip if no results or no weights
+        if not results_csv.exists():
+            continue
+        if not weights_path.exists():
+            continue
+
+        try:
+            best_val, best_epoch, col_used = get_class_map_from_results(
+                results_csv, category
+            )
+            if best_val is None:
+                continue
+
+            # Get all class metrics if available
+            df = pd.read_csv(results_csv)
+            df.columns = df.columns.str.strip()
+
+            row = {
+                "run_name": run_name,
+                "weights_path": str(weights_path),
+                "best_mAP50": round(best_val, 4),
+                "best_epoch": best_epoch,
+                "metric_used": col_used,
+            }
+
+            # Try to get per-class breakdown at best epoch
+            for cls in ["soldier", "barrier", "civilian"]:
+                cls_cols = [c for c in df.columns if cls.lower() in c.lower() and "map" in c.lower()]
+                if cls_cols:
+                    val = df[cls_cols[0]].max()
+                    row[f"{cls}_mAP50"] = round(val, 4)
+
+            results.append(row)
+
+        except Exception as e:
+            print(f"Skipping {run_name}: {e}")
+            continue
+
+    if not results:
+        print("No valid runs found.")
+        return
+
+    df_results = pd.DataFrame(results)
+    df_sorted = df_results.sort_values("best_mAP50", ascending=False).head(top_n)
+
+    print(f"\n{'='*60}")
+    print(f"TOP {top_n} RUNS — sorted by: {category.upper()} mAP50")
+    print(f"{'='*60}\n")
+
+    for i, row in df_sorted.iterrows():
+        print(f"#{df_sorted.index.get_loc(i)+1} {row['run_name']}")
+        print(f"   Weights : {row['weights_path']}")
+        print(f"   Best mAP50 ({row['metric_used']}): {row['best_mAP50']} @ epoch {row['best_epoch']}")
+        for cls in ["soldier", "barrier", "civilian"]:
+            if f"{cls}_mAP50" in row and pd.notna(row[f"{cls}_mAP50"]):
+                print(f"   {cls.capitalize()} mAP50: {row[f'{cls}_mAP50']}")
+        print()
+
+    # Also find runs that were best in ANY individual category
+    print(f"{'='*60}")
+    print("BEST RUN PER CATEGORY (even if not overall best)")
+    print(f"{'='*60}\n")
+
+    for cls in ["soldier", "barrier", "civilian"]:
+        col = f"{cls}_mAP50"
+        if col in df_results.columns:
+            best_row = df_results.loc[df_results[col].idxmax()]
+            print(f"Best {cls.upper()}: {best_row['run_name']}")
+            print(f"   Weights: {best_row['weights_path']}")
+            print(f"   {cls} mAP50: {best_row[col]}")
+            print()
+
+find_best_weights(runs_dir, category, top_n)
