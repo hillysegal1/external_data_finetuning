@@ -25,15 +25,64 @@ COCO_NAMES = {
 # Labels from the finetuned model that trigger running it
 TRIGGER_LABELS = {"soldier", "barrier"}
 
-# (finetuned_label, general_label) -> (iou_threshold, iof_threshold, strategy)
-# strategy: "always_finetuned" | "highest_conf"
-CONFLICT_RULES = {
-    ("soldier", "person"):     (0.5, 0.7, "always_finetuned"),
-    ("barrier", "car"):        (0.3, 0.6, "highest_conf"),
-    ("barrier", "truck"):      (0.3, 0.6, "highest_conf"),
-    ("barrier", "bus"):        (0.3, 0.6, "highest_conf"),
-    ("barrier", "motorcycle"): (0.3, 0.6, "highest_conf"),
+# ─────────────────────────────────────────────
+# STRATEGIES
+# ─────────────────────────────────────────────
+# Each strategy is a function with the signature:
+#   (fin_idx, gen_idx, fin_det, gen_det, suppressed_fin, suppressed_gen) -> None
+# It mutates suppressed_fin / suppressed_gen to mark which detection to drop.
+# To add a new strategy: define a function here and add it to STRATEGIES dict.
+
+def _strategy_always_finetuned(fin_idx, gen_idx, fin_det, gen_det, suppressed_fin, suppressed_gen):
+    """
+    Finetuned label always wins regardless of confidence.
+    Used for soldier vs person — a soldier IS a person, the specific
+    label always carries more information than the general one.
+    """
+    suppressed_gen.add(gen_idx)
+
+
+def _strategy_highest_conf(fin_idx, gen_idx, fin_det, gen_det, suppressed_fin, suppressed_gen):
+    """
+    Whichever model is more confident wins.
+    Used for barrier vs vehicle — they are genuinely different object types
+    so neither label has inherent priority over the other. Confidence is
+    the best available signal for which model is correct.
+    """
+    if fin_det["score"] >= gen_det["score"]:
+        suppressed_gen.add(gen_idx)
+    else:
+        suppressed_fin.add(fin_idx)
+
+
+STRATEGIES = {
+    "always_finetuned": _strategy_always_finetuned,
+    "highest_conf":     _strategy_highest_conf,
 }
+
+# ─────────────────────────────────────────────
+# CONFLICT RULES
+# ─────────────────────────────────────────────
+# (finetuned_label, general_label) -> (iou_threshold, iof_threshold, strategy_name)
+#
+# iou_threshold  — minimum IoU to declare same object (shape-sensitive)
+# iof_threshold  — minimum symmetric IoF to declare containment (catches size mismatch)
+# strategy_name  — must be a key in STRATEGIES dict above
+#
+# Rules are built programmatically so adding a new general class only
+# requires adding it to COCO_NAMES — no need to touch this block.
+
+ALL_GENERAL_LABELS = set(COCO_NAMES.values())
+SOLDIER_CONFLICTS  = {"person"}           # soldier is a human, not a vehicle
+BARRIER_CONFLICTS  = ALL_GENERAL_LABELS   # barrier can overlap or be confused with anything
+
+CONFLICT_RULES = {}
+
+for _label in SOLDIER_CONFLICTS:
+    CONFLICT_RULES[("soldier", _label)] = (0.5, 0.7, "always_finetuned")
+
+for _label in BARRIER_CONFLICTS:
+    CONFLICT_RULES[("barrier", _label)] = (0.3, 0.6, "highest_conf")
 
 # ─────────────────────────────────────────────
 # MODEL LOADING
@@ -204,17 +253,14 @@ def reconcile(gen_dets: list[dict], fin_dets: list[dict]) -> list[dict]:
             if not is_conflict(iou, iof, center_in, iou_thresh, iof_thresh):
                 continue
 
-            # Same object confirmed — apply resolution strategy
-            if strategy == "always_finetuned":
-                # Soldier is always the right label when it overlaps a person
-                suppressed_gen.add(gen_idx)
-
-            elif strategy == "highest_conf":
-                # Barrier vs vehicle — trust whichever model is more confident
-                if fin_det["score"] >= gen_det["score"]:
-                    suppressed_gen.add(gen_idx)
-                else:
-                    suppressed_fin.add(fin_idx)
+            # Same object confirmed — look up and apply resolution strategy
+            strategy_fn = STRATEGIES.get(strategy)
+            if strategy_fn is None:
+                raise ValueError(
+                    f"Unknown strategy '{strategy}' for rule {rule_key}. "
+                    f"Valid options: {list(STRATEGIES.keys())}"
+                )
+            strategy_fn(fin_idx, gen_idx, fin_det, gen_det, suppressed_fin, suppressed_gen)
 
     final = []
     for i, d in enumerate(gen_dets):
