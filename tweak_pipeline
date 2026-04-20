@@ -1,0 +1,289 @@
+from ultralytics import YOLO
+from concurrent.futures import ThreadPoolExecutor
+import torchvision.ops as ops
+import torch
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+GENERAL_MODEL_PATH  = "yolov8x.pt"         # replace with yolo26x when available
+FINETUNED_MODEL_PATH = "your_finetuned.pt"
+
+# COCO class indices for the general model
+COCO_CLASSES = {0, 2, 3, 5, 7, 9, 11}
+COCO_NAMES = {
+    0:  "person",
+    2:  "car",
+    3:  "motorcycle",
+    5:  "bus",
+    7:  "truck",
+    9:  "traffic light",
+    11: "stop sign",
+}
+
+# Labels from the finetuned model that trigger running it
+TRIGGER_LABELS = {"soldier", "barrier"}
+
+# (finetuned_label, general_label) -> (iou_threshold, iof_threshold, strategy)
+# strategy: "always_finetuned" | "highest_conf"
+CONFLICT_RULES = {
+    ("soldier", "person"):     (0.5, 0.7, "always_finetuned"),
+    ("barrier", "car"):        (0.3, 0.6, "highest_conf"),
+    ("barrier", "truck"):      (0.3, 0.6, "highest_conf"),
+    ("barrier", "bus"):        (0.3, 0.6, "highest_conf"),
+    ("barrier", "motorcycle"): (0.3, 0.6, "highest_conf"),
+}
+
+# ─────────────────────────────────────────────
+# MODEL LOADING
+# ─────────────────────────────────────────────
+
+general  = YOLO(GENERAL_MODEL_PATH)
+finetuned = YOLO(FINETUNED_MODEL_PATH)
+
+# ─────────────────────────────────────────────
+# GEOMETRY HELPERS
+# ─────────────────────────────────────────────
+
+def box_iof_symmetric(gen_boxes: torch.Tensor, fin_boxes: torch.Tensor) -> torch.Tensor:
+    """
+    Symmetric Intersection over Foreground.
+
+    Computes IoF in both directions (over gen box and over fin box) and returns
+    the max. This means it catches containment regardless of which box is bigger:
+
+      - fin box inside gen box  → iof_over_fin is high
+      - gen box inside fin box  → iof_over_gen is high
+      - adjacent / no overlap   → both are low
+
+    Args:
+        gen_boxes: (N, 4) boxes from the general model  [x1, y1, x2, y2]
+        fin_boxes: (M, 4) boxes from the finetuned model [x1, y1, x2, y2]
+
+    Returns:
+        (N, M) matrix of max IoF values
+    """
+    # Intersection rectangle
+    inter_x1 = torch.max(gen_boxes[:, None, 0], fin_boxes[None, :, 0])
+    inter_y1 = torch.max(gen_boxes[:, None, 1], fin_boxes[None, :, 1])
+    inter_x2 = torch.min(gen_boxes[:, None, 2], fin_boxes[None, :, 2])
+    inter_y2 = torch.min(gen_boxes[:, None, 3], fin_boxes[None, :, 3])
+
+    # Area of intersection — clamp to 0 if boxes don't overlap
+    inter_area = (inter_x2 - inter_x1).clamp(0) * \
+                 (inter_y2 - inter_y1).clamp(0)  # (N, M)
+
+    fin_area = (fin_boxes[:, 2] - fin_boxes[:, 0]) * \
+               (fin_boxes[:, 3] - fin_boxes[:, 1])  # (M,)
+
+    gen_area = (gen_boxes[:, 2] - gen_boxes[:, 0]) * \
+               (gen_boxes[:, 3] - gen_boxes[:, 1])  # (N,)
+
+    iof_over_fin = inter_area / fin_area.clamp(min=1e-6)          # (N, M)
+    iof_over_gen = inter_area / gen_area[:, None].clamp(min=1e-6) # (N, M)
+
+    return torch.max(iof_over_fin, iof_over_gen)  # (N, M)
+
+
+def center_inside(gen_boxes: torch.Tensor, fin_boxes: torch.Tensor) -> torch.Tensor:
+    """
+    Check whether the center of each finetuned box lies inside each general box.
+    Used as a tiebreaker when IoF is medium — an adjacent object's center will
+    be outside the neighbouring box even if there is some edge overlap.
+
+    Args:
+        gen_boxes: (N, 4)
+        fin_boxes: (M, 4)
+
+    Returns:
+        (N, M) bool tensor
+    """
+    fin_cx = (fin_boxes[:, 0] + fin_boxes[:, 2]) / 2  # (M,)
+    fin_cy = (fin_boxes[:, 1] + fin_boxes[:, 3]) / 2  # (M,)
+
+    inside_x = (fin_cx[None, :] >= gen_boxes[:, 0:1]) & \
+               (fin_cx[None, :] <= gen_boxes[:, 2:3])  # (N, M)
+    inside_y = (fin_cy[None, :] >= gen_boxes[:, 1:2]) & \
+               (fin_cy[None, :] <= gen_boxes[:, 3:4])  # (N, M)
+
+    return inside_x & inside_y  # (N, M)
+
+
+def is_conflict(
+    iou: float,
+    iof: float,
+    center_in: bool,
+    iou_thresh: float,
+    iof_thresh: float,
+) -> bool:
+    """
+    Decide whether a (gen box, fin box) pair represents the same object.
+
+    Decision tree:
+      1. IoU >= threshold → same object regardless of size difference
+      2. IoF >= threshold AND center is inside → one box contains the other
+         (e.g. finetuned drew a loose box, or detected just the rear of a truck)
+      3. Otherwise → different objects, keep both
+
+    IoF alone is not enough — a real barrier adjacent to a truck can have
+    medium IoF at the edge, but its center will be outside the truck box.
+    """
+    if iou >= iou_thresh:
+        return True
+    if iof >= iof_thresh and center_in:
+        return True
+    return False
+
+# ─────────────────────────────────────────────
+# RESULT HELPERS
+# ─────────────────────────────────────────────
+
+def get_detections(results) -> list[dict]:
+    """
+    Flatten ultralytics Results into a list of dicts:
+      { xyxy, score, label }
+    """
+    detections = []
+    for r in results:
+        for box in r.boxes:
+            detections.append({
+                "xyxy":  box.xyxy[0].cpu(),
+                "score": float(box.conf[0].cpu()),
+                "label": r.names[int(box.cls[0])],
+            })
+    return detections
+
+# ─────────────────────────────────────────────
+# RECONCILIATION
+# ─────────────────────────────────────────────
+
+def reconcile(gen_dets: list[dict], fin_dets: list[dict]) -> list[dict]:
+    """
+    Merge general and finetuned detections, resolving conflicts where both
+    models detected the same object differently.
+
+    Conflict resolution per pair type:
+      soldier vs person    → soldier always wins (semantic priority)
+      barrier vs vehicle   → highest confidence wins (model might be wrong)
+
+    A conflict is only declared when geometry confirms same object:
+      - High IoU (similar sized boxes, heavy overlap)
+      - OR high IoF + center inside (one box contained within the other)
+    """
+    if not gen_dets:
+        return [{"source": "finetuned", **d} for d in fin_dets]
+    if not fin_dets:
+        return [{"source": "general",   **d} for d in gen_dets]
+
+    gen_tensor = torch.stack([d["xyxy"] for d in gen_dets])  # (N, 4)
+    fin_tensor = torch.stack([d["xyxy"] for d in fin_dets])  # (M, 4)
+
+    iou_matrix    = ops.box_iou(gen_tensor, fin_tensor)              # (N, M)
+    iof_matrix    = box_iof_symmetric(gen_tensor, fin_tensor)        # (N, M)
+    center_matrix = center_inside(gen_tensor, fin_tensor)            # (N, M)
+
+    suppressed_gen = set()  # general detections to drop
+    suppressed_fin = set()  # finetuned detections to drop
+
+    for fin_idx, fin_det in enumerate(fin_dets):
+        if fin_det["label"] not in TRIGGER_LABELS:
+            continue
+
+        for gen_idx, gen_det in enumerate(gen_dets):
+            rule_key = (fin_det["label"], gen_det["label"])
+            if rule_key not in CONFLICT_RULES:
+                continue
+
+            iou_thresh, iof_thresh, strategy = CONFLICT_RULES[rule_key]
+
+            iou       = iou_matrix[gen_idx, fin_idx].item()
+            iof       = iof_matrix[gen_idx, fin_idx].item()
+            center_in = center_matrix[gen_idx, fin_idx].item()
+
+            if not is_conflict(iou, iof, center_in, iou_thresh, iof_thresh):
+                continue
+
+            # Same object confirmed — apply resolution strategy
+            if strategy == "always_finetuned":
+                # Soldier is always the right label when it overlaps a person
+                suppressed_gen.add(gen_idx)
+
+            elif strategy == "highest_conf":
+                # Barrier vs vehicle — trust whichever model is more confident
+                if fin_det["score"] >= gen_det["score"]:
+                    suppressed_gen.add(gen_idx)
+                else:
+                    suppressed_fin.add(fin_idx)
+
+    final = []
+    for i, d in enumerate(gen_dets):
+        if i not in suppressed_gen:
+            final.append({**d, "source": "general"})
+    for i, d in enumerate(fin_dets):
+        if i not in suppressed_fin:
+            final.append({**d, "source": "finetuned"})
+
+    return final
+
+# ─────────────────────────────────────────────
+# INFERENCE RUNNERS
+# ─────────────────────────────────────────────
+
+def run_general(image) -> list[dict]:
+    results = general(image, device="cuda:0", classes=list(COCO_CLASSES))
+    return get_detections(results)
+
+
+def run_finetuned(image) -> list[dict]:
+    results = finetuned(image, device="cuda:0")
+    return get_detections(results)
+
+# ─────────────────────────────────────────────
+# MAIN ENTRY POINT
+# ─────────────────────────────────────────────
+
+def detect(image) -> list[dict]:
+    """
+    Run detection on an image.
+
+    Flow:
+      1. Always run the general model first
+      2. If no trigger labels (soldier / barrier) detected → return as-is
+      3. If triggers detected → run finetuned model in parallel (it's already
+         running on GPU so ThreadPoolExecutor gives real concurrency)
+      4. Reconcile overlapping detections between the two models
+
+    Args:
+        image: path string, numpy array, or anything ultralytics accepts
+
+    Returns:
+        List of dicts: { xyxy, score, label, source }
+    """
+    # Step 1: general model
+    gen_dets   = run_general(image)
+    gen_labels = {d["label"] for d in gen_dets}
+
+    # Step 2: check if finetuned is needed
+    if not TRIGGER_LABELS.intersection(gen_labels):
+        return [{**d, "source": "general"} for d in gen_dets]
+
+    # Step 3: run finetuned (general already done, just launch finetuned now)
+    fin_dets = run_finetuned(image)
+
+    # Step 4: reconcile
+    return reconcile(gen_dets, fin_dets)
+
+
+# ─────────────────────────────────────────────
+# USAGE EXAMPLE
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    detections = detect("image.jpg")
+
+    for d in detections:
+        print(
+            f"[{d['source']:>10}]  {d['label']:<15}"
+            f"conf={d['score']:.2f}  box={d['xyxy'].tolist()}"
+        )
