@@ -1,0 +1,384 @@
+═══════════════════════════════════════════════════════════════════
+DUAL MODEL DETECTION + TRACKING PIPELINE — LOGIC DOCUMENTATION
+═══════════════════════════════════════════════════════════════════
+
+
+───────────────────────────────────────────────────────────────────
+1. OVERVIEW
+───────────────────────────────────────────────────────────────────
+
+Two models run on each frame:
+
+  - General model (YOLO26m): detects standard COCO classes —
+    person (0), car (2), motorcycle (3), bus (5), truck (7),
+    traffic light (9), stop sign (11)
+
+  - Finetuned model: detects domain-specific classes —
+    soldier, barrier
+
+The finetuned model only runs when the general model detects a
+"trigger label" (soldier or barrier). Otherwise only general model
+results are returned. This avoids running two full inference passes
+on every frame when it is not needed.
+
+
+───────────────────────────────────────────────────────────────────
+2. INFERENCE PARAMETERS
+───────────────────────────────────────────────────────────────────
+
+Each model has its own inference parameters because they were
+trained differently and serve different purposes.
+
+General model (YOLO26m):
+  conf=0.25       low threshold to catch everything, filter later
+  imgsz=640       standard resolution
+  iou=N/A         YOLO26 is NMS-free, iou parameter has no effect
+
+Finetuned model:
+  conf=0.35       slightly higher — domain-specific model should
+                  be more certain before reporting a detection
+  imgsz=640       match training resolution
+  iou=0.5         NMS threshold if using YOLO11-based finetuned,
+                  lower than default (0.7) because soldiers and
+                  barriers can appear close together and a high
+                  NMS threshold risks merging two nearby objects
+                  into one box before reconciliation runs
+
+NOTE on iou= parameter vs reconciliation IoU:
+  These are two completely different things.
+  - iou= in ultralytics: Non-Maximum Suppression threshold.
+    Used INSIDE the model to remove duplicate detections of the
+    same object by the same model. Has nothing to do with our code.
+  - IoU in reconciliation: our geometric check to decide if a
+    general model box and a finetuned model box are detecting
+    the same physical object. Computed AFTER inference in our code.
+
+
+───────────────────────────────────────────────────────────────────
+3. CONFLICT DETECTION — WHEN DO TWO BOXES MEAN THE SAME OBJECT?
+───────────────────────────────────────────────────────────────────
+
+After both models run, we compare every finetuned box against
+every general box. For each pair we ask: same object or different?
+
+We use three geometric signals in order:
+
+
+SIGNAL 1 — IoU (Intersection over Union)
+─────────────────────────────────────────
+         intersection
+IoU  =  ─────────────
+             union
+
+Symmetric — does not care which box is bigger. Measures how much
+two boxes overlap relative to their combined area.
+
+  0.0       no overlap at all
+  0.1–0.2   touching or small edge overlap
+  0.3–0.4   meaningful overlap, probably related
+  0.5+      heavily overlapping, likely same object
+  0.7+      almost identical boxes, definitely same object
+
+IoU is the strongest signal. If it is above threshold we declare
+a conflict immediately without checking further.
+
+Limitation: if two boxes are very different sizes (e.g. a small
+cone box inside a large truck box), the union is large and IoU
+is dragged down even if they are detecting the same object.
+This is why we need IoF as a second signal.
+
+
+SIGNAL 2 — IoF (Intersection over Foreground), symmetric
+──────────────────────────────────────────────────────────
+         intersection
+IoF  =  ─────────────────
+         one box's area
+
+Unlike IoU, IoF measures what fraction of ONE specific box is
+covered by the other. We compute it in both directions and take
+the maximum:
+
+  iof_over_fin = intersection / finetuned box area
+  iof_over_gen = intersection / general box area
+  symmetric IoF = max(iof_over_fin, iof_over_gen)
+
+Taking the max means we catch containment regardless of which
+box is bigger:
+
+  - Finetuned box inside general box:
+    iof_over_fin is high, iof_over_gen is low → max is high ✓
+
+  - General box inside finetuned box:
+    iof_over_fin is low, iof_over_gen is high → max is high ✓
+
+  - Adjacent boxes, small edge overlap:
+    both are low → max is low ✓
+
+This catches cases IoU misses — e.g. the rear end of a truck
+detected as a barrier. The barrier box is small and mostly inside
+the truck box, so IoF is high even though IoU is low.
+
+IoF is only used as a conflict signal when combined with the
+center check (see below) because IoF alone can be fooled by
+a real barrier that clips the edge of a truck box.
+
+
+SIGNAL 3 — Center inside check
+────────────────────────────────
+Check whether the center of the finetuned box lies inside the
+general box.
+
+This is the tiebreaker for medium IoF values. A real adjacent
+object (barrier next to truck) will have its center outside the
+truck box even if the edges touch. A false detection (truck rear
+end called a barrier) will have its center inside the truck box.
+
+  Real barrier next to truck:
+    barrier center is to the right, outside truck box → no conflict ✓
+
+  Truck rear end called barrier:
+    barrier center is inside the truck box → conflict ✓
+
+
+FULL CONFLICT DECISION TREE
+────────────────────────────
+
+  IoU >= threshold?
+      YES → same object, apply strategy
+      NO
+        IoF >= threshold AND center inside?
+            YES → containment confirmed, apply strategy
+            NO  → different objects, keep both
+
+
+───────────────────────────────────────────────────────────────────
+4. CONFLICT RULES — THRESHOLDS AND WHY
+───────────────────────────────────────────────────────────────────
+
+Rules are defined as:
+  (finetuned_label, general_label) → (iou_thresh, iof_thresh, strategy)
+
+
+soldier vs person  →  (0.5, 0.7, always_finetuned)
+───────────────────────────────────────────────────
+A soldier is a person. Their bounding boxes should be nearly
+identical — same height, same width, same position. IoU can
+easily reach 0.8+ for the same physical body.
+
+IoU threshold 0.5: set well below the expected 0.8+ so we catch
+all real conflicts. Still high enough that a soldier standing
+NEXT TO a civilian (IoU ~0.1) is not treated as a conflict.
+
+IoF threshold 0.7: strict because soldier and person boxes should
+be nearly the same size. If IoF is below 0.7 the boxes are too
+different in size to be the same person.
+
+Strategy always_finetuned: a soldier IS a person. The finetuned
+label is more specific, not contradictory. Confidence is
+irrelevant — even a 40% confident soldier detection beats a 95%
+confident person detection because the label carries more
+information regardless of score.
+
+
+barrier vs any general label  →  (0.3, 0.6, highest_conf)
+───────────────────────────────────────────────────────────
+Barrier covers a wide range of physical shapes — red/white
+barriers, cones, checkpoints, long thin barriers, jersey blocks.
+Each shape produces a very different bounding box. Even when the
+general model and finetuned model detect the same barrier object,
+their boxes may not align well.
+
+IoU threshold 0.3: lower than soldier because barrier boxes are
+shape-inconsistent. A cone next to a motorcycle and a wide
+barrier next to a truck will have low IoU even when detected as
+the same object. Setting threshold too high would miss these.
+0.3 is meaningful overlap for differently shaped objects.
+
+IoF threshold 0.6: 60% containment required. Strict enough to
+avoid false conflicts from edge clips between genuinely separate
+objects, but low enough to catch containment of differently
+shaped boxes.
+
+Strategy highest_conf: barrier and vehicle are genuinely
+different object types — unlike soldier/person they are not the
+same thing. A truck could genuinely be there. A barrier could
+genuinely be there. Whichever model is more confident is more
+likely to be correct.
+
+
+Edge case — truck driving behind a long/wide barrier:
+──────────────────────────────────────────────────────
+A partially visible truck behind a wide barrier produces a small
+truck box sitting inside a large barrier box. IoF will be high
+(most of the truck box is covered by the barrier box). Center
+check will likely pass too (truck center inside barrier box).
+
+This triggers a conflict and highest_conf decides the winner.
+This is acceptable — you cannot geometrically distinguish
+"truck misdetected as barrier" from "real truck behind real
+barrier." Confidence is the only available signal.
+
+If the barrier model is confident and the truck model is not
+(partially occluded truck = lower confidence) → barrier wins.
+If the truck model is confident → truck wins, barrier is kept
+as a separate detection only if its center is outside the truck.
+
+
+───────────────────────────────────────────────────────────────────
+5. STRATEGIES — HOW CONFLICTS ARE RESOLVED
+───────────────────────────────────────────────────────────────────
+
+Once a conflict is confirmed by geometry, a strategy function
+is called to decide which detection to suppress.
+
+Strategies are defined as a dict of functions in strategies.py:
+
+  STRATEGIES = {
+      "always_finetuned": _strategy_always_finetuned,
+      "highest_conf":     _strategy_highest_conf,
+  }
+
+always_finetuned:
+  Suppresses the general model detection unconditionally.
+  The finetuned label always wins regardless of confidence score.
+  Used for soldier vs person.
+
+highest_conf:
+  Compares confidence scores of both detections.
+  The detection with the higher score survives.
+  The lower confidence detection is suppressed.
+  Used for barrier vs all general labels.
+
+Using a dict means:
+  - All valid strategies are visible in one place
+  - A typo in CONFLICT_RULES raises an error immediately
+  - Adding a new strategy requires only a new function and one
+    line in the dict — reconcile() never needs to change
+
+
+───────────────────────────────────────────────────────────────────
+6. TRACKING PROBLEMS AND SOLUTIONS
+───────────────────────────────────────────────────────────────────
+
+PROBLEM 1 — Two trackers, two ID systems
+──────────────────────────────────────────
+If each model runs its own tracker, the same physical person
+gets two different track IDs:
+
+  general model tracker:   person  → ID 1
+  finetuned model tracker: soldier → ID 7   (same person)
+
+When reconciliation suppresses the person box, ID 1 disappears
+and ID 7 takes over. The tracker thinks the person left and a
+new object appeared. If finetuned does not trigger next frame,
+ID 7 disappears and ID 1 comes back — another false new object.
+
+Solution: run one single tracker on the merged output after
+reconciliation. One physical object → one box → one ID.
+The tracker never sees duplicate boxes for the same object.
+
+
+PROBLEM 2 — Label flipping between frames
+───────────────────────────────────────────
+The finetuned model only runs when a trigger is detected. A
+soldier might be labelled correctly in frame 1 but if confidence
+drops slightly and finetuned does not run in frame 2, the same
+track gets relabelled as person. Frame 3 it is soldier again:
+
+  frame 1: soldier ✓  (finetuned triggered, conf=0.72)
+  frame 2: person  ✗  (finetuned did not trigger, conf=0.28)
+  frame 3: soldier ✓  (finetuned triggered, conf=0.68)
+
+The track ID is stable but the label keeps flipping.
+
+Solution: label memory. Once a track is confidently assigned
+a finetuned label (soldier or barrier), lock that label to the
+track ID. Even if finetuned does not run next frame, the label
+stays as soldier until the track dies and is removed from memory.
+
+
+PROBLEM 3 — Label memory sticks to wrong track after ID switch
+────────────────────────────────────────────────────────────────
+If two people walk close together and the tracker confuses them
+(a common failure under occlusion), the soldier label memory
+could get assigned to the wrong track ID:
+
+  person A → ID 1 (civilian)
+  person B → ID 2 (soldier, label locked)
+
+  they cross, tracker switches IDs:
+  person A → ID 2  (now wrongly inherits soldier label)
+  person B → ID 1  (loses soldier label)
+
+This is worse than no label memory — the wrong person is
+permanently labelled as a soldier.
+
+Solution: only lock the label when confidence is high (≥ 0.6).
+A high confidence soldier detection is much less likely to be
+a tracker ID switch artefact. Low confidence detections that
+would flip the label are ignored — the existing locked label
+is kept instead.
+
+
+HOW THE THREE SOLUTIONS WORK TOGETHER
+───────────────────────────────────────
+  single tracker           solves problem 1 (no duplicate IDs)
+  label memory             solves problem 2 (no label flipping)
+  confidence threshold     solves problem 3 (memory not misassigned)
+
+Each depends on the previous:
+  - Label memory only makes sense if there is a single ID per object
+  - Confidence threshold only matters if you have label memory
+
+
+───────────────────────────────────────────────────────────────────
+7. FILE STRUCTURE
+───────────────────────────────────────────────────────────────────
+
+  constants.py    pure data — COCO_NAMES, COCO_CLASSES,
+                  TRIGGER_LABELS, CONFLICT_RULES, thresholds.
+                  No functions, no logic. Could be written as JSON.
+
+  strategies.py   strategy functions and STRATEGIES dict.
+                  All conflict resolution logic lives here.
+                  No knowledge of models or geometry.
+
+  geometry.py     box_iof_symmetric(), center_inside(),
+                  is_conflict(). Pure box math. No side effects.
+                  No knowledge of models or strategies.
+
+  utils.py        get_video_fps(), get_video_metadata(),
+                  extract_estimated_frames(). Generic helpers
+                  with no knowledge of detection logic.
+
+  detector.py     get_detections(), reconcile(), run_general(),
+                  run_finetuned(), detect(). Imports from all
+                  four files above. Main entry point.
+
+Dependency flow (no circular imports):
+  constants.py  ←── no internal imports
+  strategies.py ←── no internal imports
+  geometry.py   ←── no internal imports
+  utils.py      ←── no internal imports
+  detector.py   ←── imports from all four
+
+
+───────────────────────────────────────────────────────────────────
+8. FULL FRAME LOOP SUMMARY
+───────────────────────────────────────────────────────────────────
+
+For each frame:
+
+  1. Run general model
+  2. Check if any trigger labels detected (soldier, barrier)
+  3. If yes → run finetuned model
+     If no  → return general detections as-is
+  4. Reconcile: compare every (finetuned box, general box) pair
+       - Check IoU → if above threshold, conflict confirmed
+       - Else check IoF + center → if both above threshold, conflict
+       - Else keep both boxes
+       - On conflict: apply strategy (always_finetuned / highest_conf)
+  5. Feed merged detections into single tracker
+  6. Apply label memory to stabilise labels across frames
+  7. Clean up memory for tracks that have died
+═══════════════════════════════════════════════════════════════════
