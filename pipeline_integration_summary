@@ -1,0 +1,204 @@
+═══════════════════════════════════════════════════════════════════
+FINETUNED MODEL INTEGRATION — SUMMARY
+═══════════════════════════════════════════════════════════════════
+
+
+───────────────────────────────────────────────────────────────────
+WHAT WE BUILT
+───────────────────────────────────────────────────────────────────
+
+A dual-model detection pipeline that runs a general YOLO26m model
+alongside a finetuned model, merges their detections intelligently,
+and feeds the result into a single tracker.
+
+The finetuned model detects two domain-specific classes that the
+general model cannot reliably distinguish:
+  - soldier  (appears as person in general model)
+  - barrier  (appears as car / truck / bus etc in general model)
+
+
+───────────────────────────────────────────────────────────────────
+STEP 1 — CONDITIONAL INFERENCE
+───────────────────────────────────────────────────────────────────
+
+The finetuned model is expensive to run. We only run it when the
+general model detects something that could be a soldier or barrier.
+
+  - General model always runs first
+  - If no soldier or barrier detected → return general results only
+  - If soldier or barrier detected → also run finetuned model
+
+This means on most frames only one model runs. The finetuned model
+is only triggered when relevant.
+
+
+───────────────────────────────────────────────────────────────────
+STEP 2 — SEPARATE INFERENCE PARAMETERS PER MODEL
+───────────────────────────────────────────────────────────────────
+
+Each model has tuned parameters because they serve different roles:
+
+  General model:   conf=0.25, imgsz=640
+                   YOLO26 is NMS-free so iou= has no effect
+
+  Finetuned model: conf=0.35, imgsz=640, iou=0.5
+                   Higher conf threshold — domain model should be
+                   more certain. Lower NMS iou — soldiers and
+                   barriers can be dense, avoid merging close boxes.
+
+
+───────────────────────────────────────────────────────────────────
+STEP 3 — RECONCILIATION (THE CORE PROBLEM)
+───────────────────────────────────────────────────────────────────
+
+After both models run, the same physical object may have been
+detected by both. We need to decide: same object or different?
+
+We compare every (finetuned box, general box) pair using three
+geometric signals:
+
+  IoU — how much do the boxes overlap relative to their combined
+        area. Strong signal when boxes are similar in size.
+
+  IoF — symmetric intersection over foreground. Measures what
+        fraction of one box is covered by the other, in both
+        directions, taking the max. Catches containment when one
+        box is much smaller than the other (e.g. cone inside truck
+        box, or tight person box inside loose soldier box).
+
+  Center check — is the finetuned box center inside the general
+        box? Tiebreaker that prevents false conflicts between
+        adjacent objects whose edges touch but are separate things.
+
+Decision order:
+  1. IoU above threshold → conflict confirmed
+  2. IoF above threshold AND center inside → conflict confirmed
+  3. Otherwise → different objects, keep both
+
+
+───────────────────────────────────────────────────────────────────
+STEP 4 — CONFLICT RULES
+───────────────────────────────────────────────────────────────────
+
+Different object pairs need different thresholds and resolution
+strategies because their geometry and semantics differ.
+
+soldier vs person     iou=0.5  iof=0.7  strategy=always_finetuned
+  A soldier is a person. Boxes should be nearly identical.
+  High thresholds because a soldier NEXT TO a civilian should not
+  trigger a conflict. Finetuned always wins — the label is more
+  specific, not contradictory. Confidence is irrelevant.
+
+barrier vs anything   iou=0.3  iof=0.6  strategy=highest_conf
+  Barrier covers many shapes — cones, wide barriers, checkpoints,
+  jersey blocks. Boxes are inconsistent so thresholds are lower.
+  Neither label has inherent priority — a truck could genuinely
+  be there, or a barrier could. Highest confidence wins.
+
+Rules are built programmatically so adding a new general class
+only requires adding it to COCO_NAMES — no manual rule needed.
+
+
+───────────────────────────────────────────────────────────────────
+STEP 5 — STRATEGIES
+───────────────────────────────────────────────────────────────────
+
+Resolution strategies are defined as a dict of functions so:
+  - All valid strategies are visible in one place
+  - A typo raises an immediate error rather than silent failure
+  - Adding a new strategy never requires changing reconcile()
+
+  always_finetuned  suppress general detection unconditionally
+  highest_conf      suppress whichever detection has lower score
+
+
+───────────────────────────────────────────────────────────────────
+STEP 6 — SINGLE TRACKER ON MERGED OUTPUT
+───────────────────────────────────────────────────────────────────
+
+Running one tracker per model causes two problems:
+  - Same physical object gets two track IDs
+  - When reconciliation suppresses one box, that track ID dies
+    and the other takes over — the tracker sees a false new object
+
+Solution: run one single BoTSORT tracker on the merged detections
+after reconciliation. One object → one box → one stable ID.
+
+
+───────────────────────────────────────────────────────────────────
+STEP 7 — LABEL MEMORY
+───────────────────────────────────────────────────────────────────
+
+The finetuned model only runs on some frames. When it does not
+run, a soldier track would revert to the person label — the label
+flips every time finetuned triggers or does not trigger.
+
+Solution: once a track is assigned a finetuned label at high
+confidence (≥ 0.6), lock that label to the track ID. The label
+stays stable even on frames where finetuned does not run.
+
+The confidence threshold prevents the label memory from being
+assigned to the wrong track after a tracker ID switch — a low
+confidence detection near an occlusion is more likely to be a
+tracking error than a genuine new soldier detection.
+
+Label memory is cleared when a track dies to avoid stale entries.
+
+
+───────────────────────────────────────────────────────────────────
+KEY DESIGN DECISIONS
+───────────────────────────────────────────────────────────────────
+
+  Finetuned only runs when triggered
+    Avoids double inference on every frame. Cost is paid only
+    when soldier or barrier is actually present.
+
+  Finetuned always wins for soldier
+    A soldier is semantically a superset of person. The specific
+    label always carries more information than the general one
+    regardless of confidence scores.
+
+  Highest confidence wins for barrier
+    Barrier and vehicle are genuinely different object types.
+    Neither label has inherent priority so confidence is used
+    as a proxy for which model is more certain.
+
+  Symmetric IoF instead of one-directional
+    Either model can draw a larger box depending on the object.
+    Taking the max of both directions catches containment
+    regardless of which box is bigger.
+
+  Center check as tiebreaker
+    Shape-agnostic. A real adjacent object will have its center
+    outside the neighbouring box even if edges touch. Prevents
+    false conflicts between separate objects near each other.
+
+  Single tracker
+    Ensures one ID per physical object across all frames
+    regardless of which model detected it.
+
+  Label memory with confidence gate
+    Stabilises labels across frames without risking permanent
+    mislabelling after tracker ID switches under occlusion.
+
+
+───────────────────────────────────────────────────────────────────
+FILE STRUCTURE
+───────────────────────────────────────────────────────────────────
+
+  constants.py    COCO class definitions, trigger labels,
+                  conflict rules, thresholds. Pure data only.
+
+  strategies.py   Strategy functions and STRATEGIES dict.
+                  All conflict resolution logic.
+
+  geometry.py     IoU, IoF, center check, is_conflict().
+                  Pure box math, no side effects.
+
+  utils.py        Video utilities — fps, metadata, frame count.
+                  Generic helpers unrelated to detection logic.
+
+  detector.py     Main pipeline — inference, reconciliation,
+                  tracking, label memory. Imports from all above.
+
+═══════════════════════════════════════════════════════════════════
