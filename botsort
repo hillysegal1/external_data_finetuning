@@ -1,0 +1,201 @@
+from ultralytics.trackers.bot_sort import BOTSORT
+from ultralytics.utils import IterableSimpleNamespace
+import numpy as np
+import yaml
+
+# ─────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────
+
+TRACKER_CONFIG_PATH = "botsort_custom.yaml"
+
+# Minimum confidence to lock a finetuned label to a track ID.
+# Below this threshold the label is not locked — avoids mislabelling
+# after tracker ID switches under occlusion.
+LABEL_LOCK_CONF_THRESHOLD = 0.6
+
+# Labels that get locked to track IDs when seen at high confidence
+TRIGGER_LABELS = {"soldier", "barrier"}
+
+# Custom class IDs for finetuned labels — beyond COCO range to avoid collision
+FINETUNED_CLASS_IDS = {
+    "soldier": 80,
+    "barrier": 81,
+}
+
+# COCO label → class ID
+COCO_NAMES = {
+    0:  "person",
+    2:  "car",
+    3:  "motorcycle",
+    5:  "bus",
+    7:  "truck",
+    9:  "traffic light",
+    11: "stop sign",
+}
+
+# Combined label → class ID for tracker input
+LABEL_TO_CLASS_ID = {
+    **{v: k for k, v in COCO_NAMES.items()},
+    **FINETUNED_CLASS_IDS,
+}
+
+# Combined class ID → label for tracker output
+CLASS_ID_TO_LABEL = {v: k for k, v in LABEL_TO_CLASS_ID.items()}
+
+# ─────────────────────────────────────────────
+# TRACKER SETUP
+# ─────────────────────────────────────────────
+
+def build_tracker(config_path: str, fps: float) -> BOTSORT:
+    """
+    Instantiate a BoTSORT tracker from a custom yaml config.
+    Call once at startup before the video loop — the same instance
+    must be reused every frame to maintain track state and IDs.
+
+    Args:
+        config_path: path to botsort_custom.yaml
+        fps:         video frame rate — used to convert track_buffer
+                     from frames to time internally
+
+    Returns:
+        configured BOTSORT instance
+    """
+    with open(config_path) as f:
+        cfg = IterableSimpleNamespace(**yaml.safe_load(f))
+    return BOTSORT(args=cfg, frame_rate=fps)
+
+
+def detections_to_numpy(dets: list[dict]) -> np.ndarray:
+    """
+    Convert merged detection dicts to numpy array for BoTSORT.
+
+    BoTSORT expects each row as:
+      [x1, y1, x2, y2, confidence, class_id]
+
+    Args:
+        dets: list of detection dicts with keys xyxy, score, label
+
+    Returns:
+        (N, 6) float32 numpy array, or empty (0, 6) if no detections
+    """
+    if not dets:
+        return np.empty((0, 6), dtype=np.float32)
+
+    rows = []
+    for d in dets:
+        x1, y1, x2, y2 = d["xyxy"].tolist()
+        rows.append([
+            x1, y1, x2, y2,
+            d["score"],
+            LABEL_TO_CLASS_ID.get(d["label"], -1),
+        ])
+    return np.array(rows, dtype=np.float32)
+
+
+def parse_tracks(tracks: np.ndarray) -> list[dict]:
+    """
+    Convert BoTSORT output array back into detection dicts.
+
+    BoTSORT returns each track as:
+      [x1, y1, x2, y2, track_id, confidence, class_id, ...]
+
+    Args:
+        tracks: numpy array returned by tracker.update()
+
+    Returns:
+        list of dicts with keys: id, label, score, xyxy
+    """
+    results = []
+    for track in tracks:
+        x1, y1, x2, y2 = track[:4]
+        track_id        = int(track[4])
+        confidence      = float(track[5])
+        class_id        = int(track[6])
+        label           = CLASS_ID_TO_LABEL.get(class_id, "unknown")
+        results.append({
+            "id":    track_id,
+            "label": label,
+            "score": confidence,
+            "xyxy":  [x1, y1, x2, y2],
+        })
+    return results
+
+# ─────────────────────────────────────────────
+# LABEL MEMORY
+# ─────────────────────────────────────────────
+# Solves label flipping between frames.
+#
+# The finetuned model only runs when triggers are detected. On frames
+# where it does not run, a soldier track reverts to "person". Label
+# memory locks a finetuned label to a track ID once seen at high
+# confidence, keeping the label stable across all subsequent frames.
+#
+# Confidence gate (LABEL_LOCK_CONF_THRESHOLD) prevents the memory
+# from being assigned to the wrong track after a tracker ID switch
+# under occlusion — low confidence detections near occlusions are
+# more likely to be tracking errors than genuine new detections.
+
+TRACK_LABEL_MEMORY: dict[int, str] = {}
+
+
+def apply_label_memory(tracks: list[dict]) -> list[dict]:
+    """
+    Apply and update label memory for each track.
+
+    For each track:
+      - If label is a finetuned label AND confidence >= threshold
+          → lock label to this track ID
+      - If track ID is already in memory
+          → override current label with locked label
+
+    Args:
+        tracks: list of track dicts from parse_tracks()
+
+    Returns:
+        same list with labels stabilised across frames
+    """
+    for track in tracks:
+        track_id = track["id"]
+        label    = track["label"]
+        score    = track["score"]
+
+        if label in TRIGGER_LABELS and score >= LABEL_LOCK_CONF_THRESHOLD:
+            TRACK_LABEL_MEMORY[track_id] = label
+        elif track_id in TRACK_LABEL_MEMORY:
+            track["label"] = TRACK_LABEL_MEMORY[track_id]
+
+    return tracks
+
+
+def clear_lost_tracks(active_track_ids: list[int]) -> None:
+    """
+    Remove label memory entries for tracks that have died.
+    Prevents stale memory from being inherited by new tracks
+    that are later assigned the same ID.
+
+    Args:
+        active_track_ids: list of track IDs still alive this frame
+    """
+    lost = set(TRACK_LABEL_MEMORY.keys()) - set(active_track_ids)
+    for track_id in lost:
+        del TRACK_LABEL_MEMORY[track_id]
+
+# ─────────────────────────────────────────────
+# USAGE — how to call per frame
+# ─────────────────────────────────────────────
+#
+# # At startup — once before the video loop
+# tracker = build_tracker("botsort_custom.yaml", fps=fps)
+#
+# # Each frame
+# tracks  = tracker.update(detections_to_numpy(merged), frame)
+# results = parse_tracks(tracks)
+# results = apply_label_memory(results)
+# clear_lost_tracks([r["id"] for r in results])
+#
+# # Each result dict contains:
+# #   id    — sequential track ID, stable across whole video
+# #   label — stabilised label (soldier/barrier locked via memory)
+# #   score — confidence
+# #   xyxy  — [x1, y1, x2, y2]
