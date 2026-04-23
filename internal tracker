@@ -1,0 +1,84 @@
+The real problems we identified with two internal trackers were:
+
+ID collision — same number from both trackers
+ID switching when reconciliation suppresses a box
+Label flipping between frames
+
+All three are solvable simply:
+
+Fix 1 — ID collision: offset finetuned IDs by a large number
+FIN_ID_OFFSET = 10000
+# gen IDs: 1, 2, 3...
+# fin IDs: 10001, 10002, 10003...
+
+Fix 2 — ID switching: don't suppress boxes, just relabel
+Instead of suppressing the general model's person box when a soldier is found, keep it and just change its label. The general tracker keeps tracking, the ID stays stable, you just update the label:
+
+
+# Don't suppress — relabel
+gen_det["label"] = "soldier"
+
+Fix 3 — Label flipping: label memory keyed on gen track ID
+Same label memory as before, but simpler because the gen tracker is always running.
+
+# Both run internal trackers
+gen_results = general.track(frame, persist=True, tracker="botsort_custom.yaml")
+fin_results = finetuned.track(frame, persist=True, tracker="botsort_custom.yaml")
+
+gen_dets = get_detections_with_ids(gen_results)
+fin_dets = get_detections_with_ids(fin_results, id_offset=10000)
+
+# Reconcile — relabel instead of suppress
+final = relabel_reconcile(gen_dets, fin_dets)
+
+# Label memory on stable gen IDs
+final = apply_label_memory(final)
+
+def relabel_reconcile(gen_dets, fin_dets):
+    """
+    Instead of suppressing boxes, just upgrade labels.
+    Gen tracker keeps running, IDs stay stable.
+    Finetuned detections with no gen overlap are added as-is.
+    """
+    if not fin_dets:
+        return gen_dets
+    if not gen_dets:
+        return fin_dets
+
+    gen_tensor = torch.stack([d["xyxy"] for d in gen_dets])
+    fin_tensor = torch.stack([d["xyxy"] for d in fin_dets])
+    iou_matrix = ops.box_iou(gen_tensor, fin_tensor)
+
+    matched_fin = set()
+
+    for fin_idx, fin_det in enumerate(fin_dets):
+        if fin_det["label"] not in TRIGGER_LABELS:
+            continue
+
+        for gen_idx, gen_det in enumerate(gen_dets):
+            rule_key = (fin_det["label"], gen_det["label"])
+            if rule_key not in CONFLICT_RULES:
+                continue
+
+            iou = iou_matrix[gen_idx, fin_idx].item()
+            iou_thresh, _, _, strategy = CONFLICT_RULES[rule_key]
+
+            if iou < iou_thresh:
+                continue
+
+            # Instead of suppressing — just relabel the gen detection
+            matched_fin.add(fin_idx)
+            if strategy == "always_finetuned":
+                gen_det["label"] = fin_det["label"]   # soldier wins
+            elif strategy == "highest_conf":
+                if fin_det["score"] >= gen_det["score"]:
+                    gen_det["label"] = fin_det["label"]  # barrier wins
+
+    # Add finetuned detections that had no gen match
+    # (objects general model missed entirely)
+    final = list(gen_dets)
+    for i, d in enumerate(fin_dets):
+        if i not in matched_fin and d["label"] in TRIGGER_LABELS:
+            final.append(d)
+
+    return final
