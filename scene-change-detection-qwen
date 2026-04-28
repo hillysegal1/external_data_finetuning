@@ -1,0 +1,333 @@
+import cv2
+import numpy as np
+import requests
+import base64
+from io import BytesIO
+from PIL import Image
+import time
+
+VIDEO_PATH    = "/content/dashcam.mp4"
+MODEL_ID      = "Qwen/Qwen3-VL-8B-Instruct"
+QWEN_ENDPOINT = "https://your-qwen-endpoint/v1/chat/completions"
+QWEN_HEADERS  = {"Content-Type": "application/json"}
+
+# --------------------------------------------------
+# CONFIG
+# --------------------------------------------------
+
+start_time  = time.time()
+
+SAMPLE_FPS  = 4      # frames per second to sample
+MIN_CHUNK_S = 2.0    # minimum chunk duration
+MAX_CHUNK_S = 8.0    # maximum chunk duration
+MAX_TOKENS  = 120
+
+# --------------------------------------------------
+# VIDEO INFO
+# --------------------------------------------------
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+if not cap.isOpened():
+    raise RuntimeError(f"Could not open: {VIDEO_PATH}")
+
+native_fps   = cap.get(cv2.CAP_PROP_FPS)
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+duration     = total_frames / native_fps
+print(f"Duration: {duration:.1f}s  |  Native FPS: {native_fps}")
+
+# --------------------------------------------------
+# FRAME EXTRACTION
+# store tiny thumbnail for signal math (64x36)
+# store medium frame for model (640x360)
+# --------------------------------------------------
+
+frame_interval = max(1, int(native_fps / SAMPLE_FPS))
+frames         = []
+frame_idx      = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    if frame_idx % frame_interval == 0:
+        ts    = frame_idx / native_fps
+        rgb   = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+        # tiny greyscale thumbnail for signal — works on both colour and greyscale input
+        small = cv2.resize(frame, (64, 36))
+        gray  = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+
+        # medium colour frame for model
+        medium = cv2.resize(rgb, (640, 360))
+
+        frames.append((ts, gray, medium))
+    frame_idx += 1
+
+cap.release()
+print(f"Frames extracted: {len(frames)}")
+
+frame_timestamps = np.array([f[0] for f in frames])
+
+# --------------------------------------------------
+# CHANGE SCORE
+#
+# for each frame, compare against a stable reference
+# the reference is a rolling average of recent frames
+# during stable periods the reference tracks the scene
+# during change the reference lags behind
+# the difference between current and reference = change
+#
+# why rolling average reference rather than previous frame:
+#   - robust to gradual drift (vehicle slowly getting closer)
+#   - robust to camera vibration (averages out small jitter)
+#   - robust to compression noise (averages out artefacts)
+#   - works on greyscale and colour equally (uses grey thumbnail)
+#   - works at night (normalised so absolute brightness doesn't matter)
+# --------------------------------------------------
+
+REFERENCE_WINDOW = max(1, int(SAMPLE_FPS * 3))  # 3 second rolling average
+
+change_scores = []
+reference     = frames[0][1].copy()  # start with first frame as reference
+
+for i, (ts, gray, _) in enumerate(frames):
+    # normalise current frame brightness
+    # this makes the signal robust to time of day and lighting changes
+    # a dark night frame and a bright day frame of the same scene
+    # will produce similar change scores
+    curr_norm = gray / (gray.mean() + 1e-6)
+    ref_norm  = reference / (reference.mean() + 1e-6)
+
+    # mean absolute difference between normalised frames
+    diff  = float(np.mean(np.abs(curr_norm - ref_norm)))
+    change_scores.append(diff)
+
+    # update reference as rolling average of recent stable frames
+    # only update during stable moments — if current change is low
+    # this stops an ongoing event from becoming the new reference
+    window_start = max(0, i - REFERENCE_WINDOW)
+    recent_grays = np.array([frames[j][1] for j in range(window_start, i + 1)])
+    reference    = recent_grays.mean(axis=0)
+
+change_scores = np.array(change_scores)
+
+print(f"Mean change:  {change_scores.mean():.4f}")
+print(f"Max change:   {change_scores.max():.4f}")
+print(f"Std change:   {change_scores.std():.4f}")
+
+# --------------------------------------------------
+# THRESHOLD
+# mean + 1 std captures genuine outliers
+# adapts to whatever the normal level of change
+# is for this specific video
+# --------------------------------------------------
+
+threshold = float(change_scores.mean() + change_scores.std())
+print(f"Threshold:    {threshold:.4f}")
+
+# --------------------------------------------------
+# CHUNK BOUNDARIES
+# boundary placed where change score exceeds threshold
+# subject to min/max duration constraints
+# --------------------------------------------------
+
+boundaries    = [0.0]
+last_boundary = 0.0
+
+for i in range(1, len(change_scores)):
+    t          = frame_timestamps[i]
+    since_last = t - last_boundary
+
+    if since_last >= MAX_CHUNK_S:
+        boundaries.append(t)
+        last_boundary = t
+        continue
+
+    if since_last < MIN_CHUNK_S:
+        continue
+
+    if change_scores[i] >= threshold:
+        boundaries.append(t)
+        last_boundary = t
+
+boundaries.append(float(frame_timestamps[-1]))
+
+# build chunks
+chunks = []
+for i in range(len(boundaries) - 1):
+    cs  = round(boundaries[i], 2)
+    ce  = round(boundaries[i + 1], 2)
+    idx = np.where((frame_timestamps >= cs) & (frame_timestamps <= ce))[0]
+    avg = float(change_scores[idx].mean()) if len(idx) > 0 else 0.0
+    chunks.append((cs, ce, avg))
+
+print(f"\nChunks: {len(chunks)}")
+for cs, ce, sc in chunks:
+    print(f"  [{cs}-{ce}s] ({ce-cs:.1f}s) change={sc:.4f}")
+
+# --------------------------------------------------
+# FRAME SAMPLING
+# start, most changed middle frame, end
+# --------------------------------------------------
+
+def sample_frames(start, end):
+    idx = [i for i, (ts, *_) in enumerate(frames) if start <= ts <= end]
+    if not idx:
+        return []
+    if len(idx) <= 2:
+        return [Image.fromarray(frames[i][2]) for i in idx]
+
+    first, last = idx[0], idx[-1]
+    middle      = idx[1:-1]
+    peak        = max(middle, key=lambda i: change_scores[i]) if middle else None
+    selected    = sorted(set([first] + ([peak] if peak else []) + [last]))
+    return [Image.fromarray(frames[i][2]) for i in selected]
+
+# --------------------------------------------------
+# PROMPTS
+# --------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are analyzing dashcam footage.
+
+Only describe what is clearly visible in the frames. Do not speculate.
+
+Look for:
+- vehicles: type, position, direction, any unusual movement
+- people: location and role if visible
+- infrastructure: signs, barriers, cones, checkpoints
+- events: braking, swerving, lane departure, stopping, emergency lights
+
+Respond in this exact format:
+DESCRIPTION: one or two sentences maximum
+STATE: three words maximum describing what is still present
+"""
+
+CHUNK_PROMPT = """
+Previous: {prev_state} ({prev_time})
+Only mention the above if still visible in the current frames.
+
+Segment: {start}s to {end}s ({n_frames} frames shown)
+
+What is happening? What changed between first and last frame?
+
+DESCRIPTION:
+STATE:
+"""
+
+# --------------------------------------------------
+# CONTEXT
+# --------------------------------------------------
+
+def build_context(text, start, end):
+    state = ""
+    for line in text.splitlines():
+        if line.strip().upper().startswith("STATE:"):
+            state = line.split(":", 1)[1].strip()
+            break
+    if not state:
+        for line in text.splitlines():
+            if line.strip().upper().startswith("DESCRIPTION:"):
+                state = line.split(":", 1)[1].strip()[:80]
+                break
+    return {"prev_state": state or "nothing notable", "prev_time": f"{start}-{end}s"}
+
+def clean_output(text):
+    out = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.upper().startswith("STATE:"):
+            continue
+        if s.upper().startswith("DESCRIPTION:"):
+            remainder = s.split(":", 1)[1].strip()
+            if remainder:
+                out.append(remainder)
+        elif s:
+            out.append(s)
+    return " ".join(out)
+
+# --------------------------------------------------
+# API
+# --------------------------------------------------
+
+def call_model(messages):
+    response = requests.post(
+        QWEN_ENDPOINT,
+        headers=QWEN_HEADERS,
+        json={
+            "model":       MODEL_ID,
+            "messages":    messages,
+            "max_tokens":  MAX_TOKENS,
+            "temperature": 0,
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"].strip()
+
+def build_messages(frame_imgs, start, end, prev_context):
+    prompt = CHUNK_PROMPT.format(
+        prev_state = prev_context["prev_state"],
+        prev_time  = prev_context["prev_time"],
+        start      = start,
+        end        = end,
+        n_frames   = len(frame_imgs),
+    )
+
+    image_content = []
+    for img in frame_imgs:
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        image_content.append({
+            "type":      "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+        })
+
+    return [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": image_content + [{"type": "text", "text": prompt}]},
+    ]
+
+# --------------------------------------------------
+# RUN
+# --------------------------------------------------
+
+timeline     = []
+prev_context = {"prev_state": "start of video", "prev_time": "0s"}
+
+for i, (start, end, avg_change) in enumerate(chunks):
+    print(f"Chunk {i+1}/{len(chunks)} [{start}-{end}s] change={avg_change:.4f}")
+
+    frame_imgs = sample_frames(start, end)
+    if not frame_imgs:
+        continue
+
+    try:
+        messages = build_messages(frame_imgs, start, end, prev_context)
+        raw_text = call_model(messages)
+    except Exception as e:
+        print(f"  API error: {e}")
+        timeline.append((start, end, "API error"))
+        continue
+
+    prev_context = build_context(raw_text, start, end)
+    display_text = clean_output(raw_text)
+    timeline.append((start, end, display_text))
+    print(f"  {display_text}")
+
+# --------------------------------------------------
+# OUTPUT
+# --------------------------------------------------
+
+def fmt_ts(s, duration):
+    if duration >= 120:
+        return f"{int(s//60)}:{int(s%60):02d}"
+    return f"{s}s"
+
+print("\nTIMELINE\n" + "-" * 40)
+for s, e, t in timeline:
+    print(f"[{fmt_ts(s, duration)}-{fmt_ts(e, duration)}] {t}")
+
+print(f"\nChunks: {len(chunks)}")
+print(f"Runtime: {time.time() - start_time:.1f}s")
