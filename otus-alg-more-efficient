@@ -1,0 +1,518 @@
+# ===== Dashcam Analyzer v26-adaptive =====
+
+import torch
+import cv2
+import numpy as np
+import gc
+from PIL import Image
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from qwen_vl_utils import process_vision_info
+import time
+
+VIDEO_PATH = "/content/military.mp4"
+MODEL_ID   = "Qwen/Qwen3-VL-8B-Instruct"
+
+processor = AutoProcessor.from_pretrained(MODEL_ID, trust_remote_code=True)
+model = AutoModelForImageTextToText.from_pretrained(
+    MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    trust_remote_code=True,
+)
+
+# --------------------------------------------------
+# VIDEO INFO
+# --------------------------------------------------
+
+start_time = time.time()
+
+cap = cv2.VideoCapture(VIDEO_PATH)
+if not cap.isOpened():
+    raise RuntimeError(f"Could not open video: {VIDEO_PATH}")
+
+native_fps   = cap.get(cv2.CAP_PROP_FPS)
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+if native_fps == 0:
+    raise RuntimeError("Could not read FPS")
+
+duration = total_frames / native_fps
+print(f"Video duration: {duration:.1f}s  |  FPS: {native_fps}  |  Frames: {total_frames}")
+
+# ============================================================
+# CHANGE 1 — derive target model frame size from video resolution
+# before: hardcoded cv2.resize(frame, (640, 360)) everywhere
+# now: computed once from native resolution, aspect preserved
+# ============================================================
+
+frame_width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+MAX_SIDE     = 640
+scale        = min(MAX_SIDE / frame_width, MAX_SIDE / frame_height, 1.0)
+target_w     = int(frame_width  * scale)
+target_h     = int(frame_height * scale)
+print(f"Source: {frame_width}x{frame_height} → Model input: {target_w}x{target_h}")
+
+# --------------------------------------------------
+# FRAME EXTRACTION
+# --------------------------------------------------
+
+FLOW_FPS       = 4
+frame_interval = max(1, int(native_fps / FLOW_FPS))
+frames         = []
+frame_idx      = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+    if frame_idx % frame_interval == 0:
+        ts = frame_idx / native_fps
+
+        # ============================================================
+        # CHANGE 1 continued — two frame sizes per extraction
+        # before: gray = cv2.cvtColor(cv2.resize(frame, (640, 360)), cv2.COLOR_BGR2GRAY)
+        #         frames.append((ts, gray, float(gray.mean()), rgb))
+        # now:    small_gray at 64x36 for signal (100x fewer pixels)
+        #         medium at aspect-preserved size for model
+        # ============================================================
+        small      = cv2.resize(frame, (64, 36))
+        small_gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+
+        medium_bgr = cv2.resize(frame, (target_w, target_h))
+        medium     = cv2.cvtColor(medium_bgr, cv2.COLOR_BGR2RGB)
+
+        frames.append((ts, small_gray, float(small_gray.mean()), medium))
+    frame_idx += 1
+
+cap.release()
+print(f"Frames extracted: {len(frames)}")
+
+frame_timestamps = np.array([f[0] for f in frames])
+
+# --------------------------------------------------
+# SIGNAL COMPUTATION
+# flow now runs on 64x36 small_gray — same signal, 100x faster
+# no other change here
+# --------------------------------------------------
+
+flow_variance_scores = [0.0]
+
+for i in range(1, len(frames)):
+    flow = cv2.calcOpticalFlowFarneback(
+        frames[i-1][1], frames[i][1], None,
+        0.5, 3, 15, 3, 5, 1.2, 0
+    )
+    mag, _ = cv2.cartToPolar(flow[..., 0], flow[..., 1])
+    flow_variance_scores.append(float(np.std(mag)))
+
+flow_var_arr = np.array(flow_variance_scores)
+
+brightness_arr    = np.array([f[2] for f in frames])
+d2                = np.abs(np.diff(np.abs(np.diff(brightness_arr))))
+brightness_scores = np.concatenate([[0, 0], d2])
+
+def normalize(arr):
+    r = arr.max() - arr.min()
+    return (arr - arr.min()) / r if r > 0 else np.zeros_like(arr)
+
+importance_global = normalize(flow_var_arr) + normalize(brightness_scores)
+
+# --------------------------------------------------
+# DERIVE CONFIG — unchanged
+# --------------------------------------------------
+
+def derive_config(importance, frame_timestamps, duration):
+    importance_8u       = (importance * 127).astype(np.uint8)
+    best_thresh_8u, _   = cv2.threshold(importance_8u, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    best_thresh         = best_thresh_8u / 127.0
+    active_mask         = importance > best_thresh
+    event_density       = float(active_mask.mean())
+
+    active_times = frame_timestamps[active_mask]
+    if len(active_times) > 1:
+        gaps   = np.diff(active_times)
+        spread = float(gaps.std() / gaps.mean()) if gaps.mean() > 0 else 0.0
+    else:
+        spread = 0.0
+
+    bucket_s       = float(np.clip(duration * 0.02 / (event_density + 0.1), 3.0, 20.0))
+    chunk_busy     = float(np.clip(1.5 + spread * 0.5, 1.5, 4.0))
+    chunk_calm     = float(np.clip(duration * 0.03 + 3.0, 3.0, 20.0))
+    busy_threshold = float(np.clip(best_thresh * 0.8, 0.3, 0.8))
+
+    skip_percentile    = float(np.clip((1.0 - event_density) * 20, 0.0, 20.0)) if duration > 60 else None
+    norm_window_s      = float(np.clip(duration * 0.1, 60.0, 180.0)) if duration > 120 else None
+    summary_interval_s = float(np.clip(duration * 0.05, 30.0, 180.0)) if duration > 120 else None
+    max_tokens         = int(np.clip(140 - duration * 0.003, 80, 140))
+
+    return dict(
+        event_density      = round(event_density, 3),
+        spread             = round(spread, 3),
+        otsu_threshold     = round(best_thresh, 4),
+        bucket_s           = round(bucket_s, 1),
+        chunk_busy         = round(chunk_busy, 1),
+        chunk_calm         = round(chunk_calm, 1),
+        busy_threshold     = round(busy_threshold, 3),
+        skip_percentile    = round(skip_percentile, 1) if skip_percentile is not None else None,
+        norm_window_s      = round(norm_window_s, 1) if norm_window_s is not None else None,
+        summary_interval_s = round(summary_interval_s, 1) if summary_interval_s is not None else None,
+        max_tokens         = max_tokens,
+    )
+
+cfg = derive_config(importance_global, frame_timestamps, duration)
+
+print(f"\n--- AUTO CONFIG ---")
+print(f"Event density:    {cfg['event_density']} ({cfg['event_density']*100:.0f}% of frames active)")
+print(f"Event spread:     {cfg['spread']} ({'bursty' if cfg['spread'] > 1.0 else 'even'})")
+print(f"Otsu threshold:   {cfg['otsu_threshold']}")
+print(f"bucket_s:         {cfg['bucket_s']}s")
+print(f"chunk_busy:       {cfg['chunk_busy']}s")
+print(f"chunk_calm:       {cfg['chunk_calm']}s")
+print(f"busy_threshold:   {cfg['busy_threshold']}")
+print(f"skip_percentile:  {cfg['skip_percentile']}")
+print(f"norm_window_s:    {cfg['norm_window_s']}")
+print(f"summary_interval: {cfg['summary_interval_s']}")
+print(f"max_tokens:       {cfg['max_tokens']}")
+
+# --------------------------------------------------
+# LOCAL NORMALIZATION
+# ============================================================
+# CHANGE 2 — EMA instead of rebuilding window every frame
+# before: for every frame, collected all frames in window,
+#         built numpy array, computed min/max, normalized
+#         O(n * window_size) total
+# now:    single running average updated per frame
+#         O(n) total
+# ============================================================
+
+def compute_local_importance(flow_var_arr, brightness_scores, norm_window_s, frame_timestamps):
+    if norm_window_s is None:
+        return importance_global
+
+    window_frames = max(1, int(FLOW_FPS * norm_window_s))
+    alpha         = 2.0 / (window_frames + 1)
+
+    fv_local = np.zeros(len(flow_var_arr))
+    bs_local = np.zeros(len(brightness_scores))
+    fv_run   = float(flow_var_arr[0])
+    bs_run   = float(brightness_scores[0])
+
+    for i in range(len(flow_var_arr)):
+        fv_run      = (1 - alpha) * fv_run + alpha * float(flow_var_arr[i])
+        bs_run      = (1 - alpha) * bs_run + alpha * float(brightness_scores[i])
+        fv_local[i] = fv_run
+        bs_local[i] = bs_run
+
+    # normalize each frame against its local running baseline
+    importance_local = np.zeros(len(flow_var_arr))
+    fv_range = fv_local.max() - fv_local.min()
+    bs_range = bs_local.max() - bs_local.min()
+
+    for i in range(len(flow_var_arr)):
+        fv_norm = (flow_var_arr[i] - fv_local.min()) / fv_range if fv_range > 0 else 0.0
+        bs_norm = (brightness_scores[i] - bs_local.min()) / bs_range if bs_range > 0 else 0.0
+        importance_local[i] = fv_norm + bs_norm
+
+    return importance_local
+
+importance = compute_local_importance(
+    flow_var_arr, brightness_scores,
+    cfg["norm_window_s"], frame_timestamps
+)
+
+# --------------------------------------------------
+# BUILD CHUNK PLAN
+# ============================================================
+# CHANGE 3 — pre-assign frames to buckets once
+# before: for every bucket, scanned all frame_timestamps
+#         with np.where((frame_timestamps >= bs) & ...)
+#         O(n * num_buckets) total
+# now:    divide timestamps by bucket_size once
+#         O(n) total, then lookup by bucket index
+# ============================================================
+
+skip_threshold = (
+    float(np.percentile(importance, cfg["skip_percentile"]))
+    if cfg["skip_percentile"] is not None else None
+)
+
+bucket_size    = cfg["bucket_s"]
+bucket_indices = (frame_timestamps // bucket_size).astype(int)
+unique_buckets = np.unique(bucket_indices)
+chunks         = []
+
+for b in unique_buckets:
+    bucket_idx = np.where(bucket_indices == b)[0]
+    if len(bucket_idx) == 0:
+        continue
+
+    bs = float(b * bucket_size)
+    be = min(bs + bucket_size, duration)
+
+    mean_imp   = float(importance[bucket_idx].mean())
+    chunk_dur  = cfg["chunk_busy"] if mean_imp >= cfg["busy_threshold"] else cfg["chunk_calm"]
+    chunk_type = "busy" if mean_imp >= cfg["busy_threshold"] else "calm"
+
+    t = bs
+    while t < be:
+        cs = round(t, 2)
+        ce = round(min(t + chunk_dur, be), 2)
+        if ce > cs:
+            chunks.append((cs, ce, chunk_type))
+        t += chunk_dur
+
+busy_count = sum(1 for *_, ct in chunks if ct == "busy")
+calm_count = sum(1 for *_, ct in chunks if ct == "calm")
+
+print(f"\n--- CHUNKS ---")
+print(f"Total: {len(chunks)} (busy: {busy_count}, calm: {calm_count})")
+for cs, ce, ct in chunks:
+    print(f"  [{cs}-{ce}s] {ct} ({ce-cs:.2f}s)")
+
+# --------------------------------------------------
+# FRAME SAMPLING — unchanged except index 3 for model frame
+# --------------------------------------------------
+
+def sample_frames(start, end, chunk_type):
+    indices = [i for i, (ts, *_) in enumerate(frames) if start <= ts <= end]
+    if not indices:
+        return []
+    if len(indices) <= 2:
+        return [Image.fromarray(frames[i][3]) for i in indices]
+
+    first_idx, last_idx = indices[0], indices[-1]
+    middle = indices[1:-1]
+
+    if not middle:
+        return [Image.fromarray(frames[i][3]) for i in [first_idx, last_idx]]
+
+    sorted_mid = sorted(middle, key=lambda i: importance[i], reverse=True)
+
+    if chunk_type == "busy" and len(sorted_mid) >= 2:
+        selected = sorted(set([first_idx, sorted_mid[0], sorted_mid[1], last_idx]))
+    else:
+        selected = sorted(set([first_idx, sorted_mid[0], last_idx]))
+
+    return [Image.fromarray(frames[i][3]) for i in selected]
+
+# --------------------------------------------------
+# PROMPTS — unchanged
+# --------------------------------------------------
+
+SYSTEM_PROMPT = """
+You are analyzing dashcam footage frame by frame.
+
+WHAT TO REPORT (only if clearly visible):
+- Vehicles: type, color, lane position, direction, whether moving or stopped
+- People: location, role if identifiable (military, police, worker, civilian)
+- Infrastructure: barriers, cones, checkpoints, signage, lane markings
+- Events: lane departure, sudden braking, wrong-way travel, emergency lights, smoke, debris
+
+STRICT RULES:
+- Describe only what you can directly see in these frames
+- Do not infer, assume, or speculate
+- Do not repeat or reference the previous scene unless the same object is still visible
+- If nothing notable is happening, say so plainly
+
+RESPONSE FORMAT — always use exactly this structure:
+DESCRIPTION: one sentence if nothing changed, two sentences maximum if something happened
+STATE: three words maximum summarising what is still present (e.g. "convoy moving, checkpoint ahead")
+"""
+
+CHUNK_PROMPT = """
+{summary_block}Previous segment ({prev_time}): {prev_state}
+Only reference the above if the same vehicle or person is clearly still visible.
+
+Current segment: {start}s to {end}s
+Frames shown: {n_frames} ({frame_desc})
+
+Describe what is visible and what changed between the first and last frame.
+Two sentences maximum if something happened, one if nothing changed.
+
+DESCRIPTION:
+STATE:
+"""
+
+# --------------------------------------------------
+# CONTEXT — unchanged
+# --------------------------------------------------
+
+def build_context(text, start, end, current_summary):
+    state = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("STATE:"):
+            candidate = stripped.split(":", 1)[1].strip()
+            if candidate:
+                state = candidate
+            break
+
+    if not state:
+        for line in text.splitlines():
+            if line.strip().upper().startswith("DESCRIPTION:"):
+                desc = line.split(":", 1)[1].strip()
+                break
+        else:
+            desc = text.strip()
+        short = desc[:80]
+        if len(desc) > 80 and " " in short:
+            short = short.rsplit(" ", 1)[0]
+        state = short
+
+    return {
+        "prev_state": state,
+        "prev_time":  f"{start}-{end}s",
+        "summary":    current_summary,
+    }
+
+def clean_output(text):
+    lines = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.upper().startswith("STATE:"):
+            continue
+        if s.upper().startswith("DESCRIPTION:"):
+            remainder = s.split(":", 1)[1].strip()
+            if remainder:
+                lines.append(remainder)
+        elif s:
+            lines.append(s)
+    return " ".join(lines)
+
+def summarize_recent(timeline_slice):
+    states = [state for *_, state in timeline_slice if state]
+    if not states:
+        return "no notable activity"
+    seen, dedup = set(), []
+    for s in states:
+        if s not in seen:
+            seen.add(s)
+            dedup.append(s)
+    return ", ".join(dedup[-5:])
+
+def format_summary_block(summary):
+    if not summary:
+        return ""
+    return f"Scene context so far: {summary}\n"
+
+# --------------------------------------------------
+# INFERENCE — unchanged
+# --------------------------------------------------
+
+def analyze_chunk(frame_imgs, start, end, prev_context, max_tokens):
+    frame_desc = (
+        "start / two peak moments / end" if len(frame_imgs) == 4
+        else "start / peak moment / end"
+    )
+
+    prompt = CHUNK_PROMPT.format(
+        summary_block = format_summary_block(prev_context.get("summary")),
+        start         = start,
+        end           = end,
+        prev_state    = prev_context["prev_state"],
+        prev_time     = prev_context["prev_time"],
+        n_frames      = len(frame_imgs),
+        frame_desc    = frame_desc,
+    )
+
+    image_msgs = [{"type": "image", "image": f} for f in frame_imgs]
+    messages   = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user",   "content": image_msgs + [{"type": "text", "text": prompt}]}
+    ]
+
+    text_in         = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, _ = process_vision_info(messages)
+    inputs          = processor(
+        text=[text_in], images=image_inputs,
+        padding=True, return_tensors="pt"
+    ).to(model.device)
+
+    with torch.inference_mode():
+        output = model.generate(
+            **inputs,
+            max_new_tokens=max_tokens,
+            temperature=0,
+            do_sample=False,
+        )
+
+    trimmed = output[:, inputs["input_ids"].shape[1]:]
+    result  = processor.batch_decode(trimmed, skip_special_tokens=True)[0]
+
+    del inputs, output
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return result.strip()
+
+# --------------------------------------------------
+# RUN — unchanged
+# --------------------------------------------------
+
+timeline          = []
+prev_context      = {"prev_state": "start of video", "prev_time": "0s", "summary": None}
+running_summary   = None
+last_summary_time = 0.0
+skipped           = 0
+
+for i, (start, end, chunk_type) in enumerate(chunks):
+    label = "BUSY" if chunk_type == "busy" else "CALM"
+    print(f"Chunk {i+1}/{len(chunks)} [{start}-{end}s] {label} ({end-start:.2f}s)")
+
+    if cfg["summary_interval_s"] and start - last_summary_time >= cfg["summary_interval_s"]:
+        running_summary          = summarize_recent(timeline[-15:])
+        last_summary_time        = start
+        prev_context["summary"]  = running_summary
+        print(f"  → summary: {running_summary}")
+
+    chunk_idx = np.where((frame_timestamps >= start) & (frame_timestamps <= end))[0]
+    if skip_threshold is not None and len(chunk_idx) > 0:
+        if float(importance[chunk_idx].mean()) < skip_threshold:
+            print(f"  → skipped")
+            timeline.append((start, end, chunk_type, "no significant activity", None))
+            skipped += 1
+            continue
+
+    frame_imgs = sample_frames(start, end, chunk_type)
+    if not frame_imgs:
+        continue
+
+    raw_text     = analyze_chunk(frame_imgs, start, end, prev_context, cfg["max_tokens"])
+    prev_context = build_context(raw_text, start, end, running_summary)
+    display_text = clean_output(raw_text)
+    timeline.append((start, end, chunk_type, display_text, prev_context["prev_state"]))
+
+# --------------------------------------------------
+# OUTPUT — unchanged
+# --------------------------------------------------
+
+def print_timeline(timeline, duration):
+    busy_entries = [(s, e, t) for s, e, ct, t, _ in timeline if ct == "busy"]
+
+    if duration >= 120 and busy_entries:
+        print("\nNOTABLE EVENTS\n" + "-" * 40)
+        for s, e, t in busy_entries:
+            mins_s = int(s // 60)
+            mins_e = int(e // 60)
+            ts     = f"{mins_s}:{int(s%60):02d}-{mins_e}:{int(e%60):02d}"
+            print(f"[{ts}] {t}")
+
+    print("\nFULL TIMELINE\n" + "-" * 40)
+    for s, e, ct, t, state in timeline:
+        if duration >= 120:
+            mins_s = int(s // 60)
+            mins_e = int(e // 60)
+            ts     = f"{mins_s}:{int(s%60):02d}-{mins_e}:{int(e%60):02d}"
+        else:
+            ts = f"{s}-{e}s"
+        tag = " [BUSY]" if ct == "busy" else ""
+        print(f"[{ts}]{tag} {t}")
+        if state and ct == "busy":
+            print(f"         → {state}")
+
+print_timeline(timeline, duration)
+
+print(f"\nTotal chunks:  {len(chunks)}")
+print(f"Model calls:   {len(chunks) - skipped}")
+print(f"Skipped:       {skipped}")
+print(f"Runtime:       {time.time() - start_time:.1f}s")
