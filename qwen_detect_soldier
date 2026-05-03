@@ -1,0 +1,111 @@
+import cv2
+import base64
+import json
+import os
+from openai import OpenAI
+
+# ---- FILL THESE IN ----
+API_KEY = os.getenv("DASHSCOPE_API_KEY")  # or hardcode your key
+MODEL = "qwen3-vl-plus"  # or qwen3-vl-32b-instruct, qwen3-vl-235b-a22b-instruct
+# -----------------------
+
+client = OpenAI(
+    api_key=API_KEY,
+    base_url="https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+)
+
+
+def yolo_to_pixel(box, img_w, img_h):
+    """Convert YOLO format (cx, cy, w, h) normalized to pixel (x1, y1, x2, y2)."""
+    cx, cy, w, h = box
+    x1 = int((cx - w / 2) * img_w)
+    y1 = int((cy - h / 2) * img_h)
+    x2 = int((cx + w / 2) * img_w)
+    y2 = int((cy + h / 2) * img_h)
+    return x1, y1, x2, y2
+
+
+def draw_boxes(frame, boxes):
+    """Draw numbered bounding boxes on a copy of the frame."""
+    annotated = frame.copy()
+    for i, box in enumerate(boxes, start=1):
+        h, w = frame.shape[:2]
+        x1, y1, x2, y2 = yolo_to_pixel(box, w, h)
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.putText(annotated, str(i), (x1, y1 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
+    return annotated
+
+
+def encode_frame(frame):
+    """Encode a cv2 frame to base64 JPEG."""
+    _, buffer = cv2.imencode(".jpg", frame)
+    return base64.b64encode(buffer).decode("utf-8")
+
+
+def validate_detections(frame, yolo_boxes):
+    """
+    frame      : numpy array (H, W, 3) BGR from cv2
+    yolo_boxes : list of [cx, cy, w, h] in normalized YOLO format
+    """
+    annotated_frame = draw_boxes(frame, yolo_boxes)
+    b64_image = encode_frame(annotated_frame)
+
+    num_boxes = len(yolo_boxes)
+    box_list = "\n".join([f"  Box {i+1}" for i in range(num_boxes)])
+
+    prompt = f"""You are analyzing a dashcam video frame.
+A soldier is a person in military uniform or combat gear, possibly carrying a weapon.
+
+The image has {num_boxes} green bounding box(es) drawn on it, numbered 1 to {num_boxes}:
+{box_list}
+
+Respond ONLY in valid JSON with this exact structure:
+{{
+  "scene_description": "<one sentence describing the overall scene>",
+  "detections": [
+    {{
+      "box_id": <number>,
+      "is_soldier": <true or false>,
+      "reason": "<brief reason>"
+    }}
+  ],
+  "missed_soldiers": "<describe any soldier visible in the frame NOT inside a box, or null if none>"
+}}"""
+
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{b64_image}"},
+                    },
+                ],
+            }
+        ],
+        max_tokens=512,
+    )
+
+    raw = response.choices[0].message.content
+    # Strip markdown fences if present
+    clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+    return json.loads(clean)
+
+
+# ---- USAGE EXAMPLE ----
+if __name__ == "__main__":
+    frame = cv2.imread("your_frame.jpg")  # load your frame here
+
+    # YOLO format: [cx, cy, w, h] normalized 0-1
+    boxes = [
+        [0.5, 0.4, 0.1, 0.3],
+        [0.8, 0.6, 0.05, 0.2],
+    ]
+
+    result = validate_detections(frame, boxes)
+    print(json.dumps(result, indent=2))
