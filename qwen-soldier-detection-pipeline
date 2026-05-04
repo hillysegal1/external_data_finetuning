@@ -1,0 +1,225 @@
+"""
+qwen_soldier_confirmer.py
+
+Runs Qwen VL in a background thread to confirm soldier detections.
+Attaches the result directly onto your existing track dict so it gets
+included in the S3 upload with everything else.
+
+Usage:
+    from qwen_soldier_confirmer import SoldierConfirmer
+
+    confirmer = SoldierConfirmer()
+    confirmer.start()
+
+    # When you update highest_confidence in your pipeline, also call:
+    confirmer.update_best_frame(track_id=track["trackId"],
+                                frame=frame,          # numpy array
+                                bboxes=soldier_bboxes,
+                                conf=conf)
+
+    # When a track ends and before you upload to S3:
+    confirmer.finalize_track(track)   # blocks briefly only if Qwen isn't done yet
+
+    confirmer.stop()  # after all videos are done
+"""
+
+import base64
+import io
+import json
+import logging
+import os
+import threading
+import urllib.request
+from queue import Queue, Empty
+
+import numpy as np
+from PIL import Image
+
+logger = logging.getLogger(__name__)
+
+API_KEY = os.environ.get("DASHSCOPE_API_KEY", "YOUR_API_KEY_HERE")
+MODEL   = "qwen-vl-max"
+API_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
+
+SOLDIER_DEFINITION = """
+A soldier is identifiable by one or more of:
+- Military uniform (camouflage, olive drab, combat fatigues)
+- Tactical gear: body armor, plate carrier, helmet, load-bearing vest
+- Weapons: rifle, handgun, or military-grade weaponry
+- Military insignia, patches, rank markings
+- Tactical accessories: radio, night-vision, gloves, knee pads
+
+A person in civilian clothing with no gear or weapons is NOT a soldier.
+When in doubt, return false unless clear military indicators are present.
+""".strip()
+
+
+class SoldierConfirmer:
+
+    def __init__(self, api_key: str = API_KEY):
+        self.api_key = api_key
+
+        # trackId -> {"frame": np.ndarray, "bboxes": list, "conf": float, "result": dict|None}
+        self._tracks: dict = {}
+        self._lock = threading.Lock()
+
+        self._queue  = Queue()
+        self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._stop_event = threading.Event()
+
+    def start(self):
+        self._worker.start()
+
+    def stop(self):
+        """Call once after all videos are processed."""
+        self._queue.join()
+        self._stop_event.set()
+        self._worker.join(timeout=10)
+
+    def update_best_frame(self, track_id: str, frame: np.ndarray,
+                          bboxes: list, conf: float):
+        """
+        Call this whenever you update highest_confidence for a track —
+        i.e. in the same place you currently do:
+            track["highest_confidence"] = conf
+            track["highest_conf_frame"] = frame_idx
+
+        Args:
+            track_id : your trackId string
+            frame    : the raw numpy frame (BGR, HWC) at this confidence
+            bboxes   : list of {"bbox": [x1,y1,x2,y2], "conf": float} for soldier detections
+            conf     : the new highest confidence value
+        """
+        with self._lock:
+            self._tracks[track_id] = {
+                "frame":  frame.copy(),
+                "bboxes": bboxes,
+                "conf":   conf,
+                "result": None,   # filled in by worker
+                "event":  threading.Event(),
+            }
+
+        # Submit to background worker immediately
+        self._queue.put(track_id)
+
+    def finalize_track(self, track: dict, timeout: float = 30.0):
+        """
+        Call this just before you upload the track dict to S3.
+        Waits for Qwen's result (if not done yet) and writes it
+        directly into the track dict under the key "soldierConfirmed".
+
+        Args:
+            track   : your existing track dict (mutated in place)
+            timeout : max seconds to wait for Qwen (default 30s)
+        """
+        track_id = track["trackId"]
+
+        with self._lock:
+            info = self._tracks.get(track_id)
+
+        if info is None:
+            # Track had no soldier detections — nothing to confirm
+            track["soldierConfirmed"] = None
+            return
+
+        # Wait for worker to finish (it's probably already done)
+        finished = info["event"].wait(timeout=timeout)
+
+        with self._lock:
+            result = self._tracks.pop(track_id, {}).get("result")
+
+        if not finished or result is None:
+            logger.warning("[SoldierConfirmer] timeout waiting for track %s", track_id)
+            track["soldierConfirmed"] = None
+        else:
+            track["soldierConfirmed"] = result
+
+    # ── Background worker ─────────────────────────────────────────────────────
+
+    def _worker_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                track_id = self._queue.get(timeout=1)
+            except Empty:
+                continue
+            try:
+                self._process(track_id)
+            except Exception as e:
+                logger.error("[SoldierConfirmer] error on track %s: %s", track_id, e)
+                with self._lock:
+                    if track_id in self._tracks:
+                        self._tracks[track_id]["result"] = None
+                        self._tracks[track_id]["event"].set()
+            finally:
+                self._queue.task_done()
+
+    def _process(self, track_id: str):
+        with self._lock:
+            info = self._tracks.get(track_id)
+        if info is None:
+            return
+
+        frame_bgr = info["frame"]
+        bboxes    = info["bboxes"]
+
+        img = Image.fromarray(frame_bgr[:, :, ::-1].astype(np.uint8))
+        result = self._call_qwen(img, bboxes)
+
+        with self._lock:
+            if track_id in self._tracks:
+                self._tracks[track_id]["result"] = result
+                self._tracks[track_id]["event"].set()
+
+        logger.info("[SoldierConfirmer] track %s → is_soldier=%s", track_id, result.get("is_soldier"))
+
+    def _call_qwen(self, img: Image.Image, bboxes: list) -> dict:
+        w, h = img.size
+        buf  = io.BytesIO()
+        img.convert("RGB").save(buf, format="JPEG")
+        b64  = base64.b64encode(buf.getvalue()).decode()
+
+        det_lines = "\n".join(
+            f"  #{i}: bbox=[x1={b['bbox'][0]}, y1={b['bbox'][1]}, x2={b['bbox'][2]}, y2={b['bbox'][3]}], conf={b['conf']:.2f}"
+            for i, b in enumerate(bboxes, 1)
+        )
+
+        prompt = f"""Image size: {w}x{h}px. Coordinates are pixels, origin top-left.
+
+YOLO flagged these regions as potential soldiers:
+{det_lines}
+
+A soldier is defined as:
+{SOLDIER_DEFINITION}
+
+Return JSON only — no markdown, no extra text:
+{{
+  "scene": "<one sentence describing the overall scene>",
+  "is_soldier": true | false
+}}"""
+
+        payload = {
+            "model": MODEL,
+            "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                {"type": "text", "text": prompt},
+            ]}],
+            "max_tokens": 150,
+            "temperature": 0.1,
+        }
+
+        req = urllib.request.Request(
+            API_URL,
+            data=json.dumps(payload).encode(),
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read())
+
+        raw = body["choices"][0]["message"]["content"].strip()
+        if raw.startswith("```"):
+            raw = "\n".join(raw.split("\n")[1:-1])
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return {"is_soldier": None, "scene": raw}
