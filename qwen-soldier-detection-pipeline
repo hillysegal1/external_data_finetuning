@@ -172,28 +172,37 @@ class SoldierConfirmer:
 
         logger.info("[SoldierConfirmer] track %s → is_soldier=%s", track_id, result.get("is_soldier"))
 
-    def _call_qwen(self, img: Image.Image, bboxes: list) -> dict:
+    @staticmethod
+    def _crop_padded(img: Image.Image, bbox: list, padding: float = 0.15) -> Image.Image:
+        """Crop bbox with percentage-based padding, clamped to image bounds."""
         w, h = img.size
-        buf  = io.BytesIO()
-        img.convert("RGB").save(buf, format="JPEG")
-        b64  = base64.b64encode(buf.getvalue()).decode()
+        x1, y1, x2, y2 = bbox
+        bw, bh = x2 - x1, y2 - y1
+        pad_x  = int(bw * padding)
+        pad_y  = int(bh * padding)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(w, x2 + pad_x)
+        y2 = min(h, y2 + pad_y)
+        return img.crop((x1, y1, x2, y2))
 
-        det_lines = "\n".join(
-            f"  #{i}: bbox=[x1={b['bbox'][0]}, y1={b['bbox'][1]}, x2={b['bbox'][2]}, y2={b['bbox'][3]}], conf={b['conf']:.2f}"
-            for i, b in enumerate(bboxes, 1)
-        )
+    def _call_qwen(self, img: Image.Image, bboxes: list) -> dict:
+        # Crop around the highest-confidence detection with 15% padding
+        best_bbox = max(bboxes, key=lambda b: b["conf"])
+        crop      = self._crop_padded(img, best_bbox["bbox"], padding=0.15)
 
-        prompt = f"""Image size: {w}x{h}px. Coordinates are pixels, origin top-left.
+        buf = io.BytesIO()
+        crop.convert("RGB").save(buf, format="JPEG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
 
-YOLO flagged these regions as potential soldiers:
-{det_lines}
+        prompt = f"""This is a cropped region from a video frame where YOLO detected a potential soldier (confidence: {best_bbox['conf']:.2f}).
 
 A soldier is defined as:
 {SOLDIER_DEFINITION}
 
 Return JSON only — no markdown, no extra text:
 {{
-  "scene": "<one sentence describing the overall scene>",
+  "scene": "<one sentence describing what you see in this image>",
   "is_soldier": true | false
 }}"""
 
