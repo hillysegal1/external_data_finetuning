@@ -7,6 +7,7 @@
 # ── Cell 1: Config ─────────────────────────────────────────────────────────────
 from ultralytics import YOLO
 from pathlib import Path
+from itertools import groupby
 from IPython.display import display, Markdown
 import numpy as np
 import cv2
@@ -16,11 +17,10 @@ import matplotlib.pyplot as plt
 MODEL_PATH   = "your_finetuned_model.pt"
 TRACKER      = "custom_botsort.yaml"
 DATA_YAML    = "data.yaml"
-MIN_CONF     = 0.25       # low enough to catch everything
-IOU_THRESH   = 0.5        # IoU threshold to match detection to ground truth box
+MIN_CONF     = 0.25
+IOU_THRESH   = 0.5
 FPS          = 35
 
-# Class mapping from your labels
 CLASS_MAP = {
     0: "soldier",
     1: "barrier",
@@ -29,71 +29,73 @@ CLASS_MAP = {
 VALID_LABELS = {"soldier", "civilian"}
 
 
-# ── Cell 2: Load val image paths and label paths from data.yaml ────────────────
+# ── Cell 2: Load val images grouped by video ───────────────────────────────────
 with open(DATA_YAML) as f:
     data_cfg = yaml.safe_load(f)
 
 data_root = Path(data_cfg.get("path", "."))
 val_imgs  = data_root / data_cfg["val"]
-
-# Collect all val images sorted — order matters for tracking continuity
-image_paths = sorted(val_imgs.glob("*.jpg")) + sorted(val_imgs.glob("*.png"))
-print(f"Found {len(image_paths)} val images in {val_imgs}")
-
-# Label dir — same structure as images but in labels/
 label_dir = Path(str(val_imgs).replace("images", "labels"))
-print(f"Label dir: {label_dir}")
+
+print(f"Val images : {val_imgs}")
+print(f"Labels     : {label_dir}")
+
+def get_video_id(path: Path) -> str:
+    # "frame_vid_07_000315.jpg" -> "vid_07"
+    parts = path.stem.split("_")
+    return f"{parts[1]}_{parts[2]}"
+
+image_paths = sorted(val_imgs.glob("*.jpg")) + sorted(val_imgs.glob("*.png"))
+image_paths = sorted(image_paths, key=get_video_id)
+
+video_groups = {
+    vid_id: sorted(paths)
+    for vid_id, paths in groupby(image_paths, key=get_video_id)
+}
+
+print(f"\nFound {len(video_groups)} videos:")
+for vid_id, paths in video_groups.items():
+    print(f"  {vid_id}: {len(paths)} frames")
 
 
-# ── Cell 3: Helper — load ground truth boxes for a frame ──────────────────────
+# ── Cell 3: Helpers — GT loading and IoU ──────────────────────────────────────
 def load_gt(label_path: Path, img_w: int, img_h: int) -> list:
-    """
-    Load YOLO format ground truth boxes for a frame.
-    Returns list of {"class": str, "bbox": [x1,y1,x2,y2]}
-    """
+    """Load YOLO format GT labels. Returns list of {class, bbox [x1,y1,x2,y2]}."""
     if not label_path.exists():
         return []
-
     gt_boxes = []
     with open(label_path) as f:
         for line in f:
             parts = line.strip().split()
             if len(parts) < 5:
                 continue
-            cls_id           = int(parts[0])
-            xc, yc, bw, bh  = map(float, parts[1:5])
-
-            # Convert normalized to absolute pixel coords
+            cls_id          = int(parts[0])
+            xc, yc, bw, bh = map(float, parts[1:5])
             x1 = int((xc - bw / 2) * img_w)
             y1 = int((yc - bh / 2) * img_h)
             x2 = int((xc + bw / 2) * img_w)
             y2 = int((yc + bh / 2) * img_h)
-
             class_name = CLASS_MAP.get(cls_id)
             if class_name in VALID_LABELS:
                 gt_boxes.append({"class": class_name, "bbox": [x1, y1, x2, y2]})
-
     return gt_boxes
 
 
 def compute_iou(box_a: list, box_b: list) -> float:
-    """Compute IoU between two [x1,y1,x2,y2] boxes."""
     xa1 = max(box_a[0], box_b[0])
     ya1 = max(box_a[1], box_b[1])
     xa2 = min(box_a[2], box_b[2])
     ya2 = min(box_a[3], box_b[3])
-
     inter = max(0, xa2 - xa1) * max(0, ya2 - ya1)
     if inter == 0:
         return 0.0
-
     area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
     area_b = (box_b[2] - box_b[0]) * (box_b[3] - box_b[1])
     return inter / (area_a + area_b - inter)
 
 
 def match_to_gt(det_bbox: list, gt_boxes: list) -> str | None:
-    """Match a detection bbox to the best overlapping GT box. Returns class or None."""
+    """Match detection to best overlapping GT box. Returns class or None."""
     best_iou   = IOU_THRESH
     best_class = None
     for gt in gt_boxes:
@@ -104,80 +106,80 @@ def match_to_gt(det_bbox: list, gt_boxes: list) -> str | None:
     return best_class
 
 
-# ── Cell 4: Run tracking and match to ground truth ────────────────────────────
+# ── Cell 4: Run tracking per video and match to ground truth ──────────────────
 model      = YOLO(MODEL_PATH)
-all_tracks = {}  # track_id -> stats
+all_tracks = {}  # (vid_id, track_id) -> stats
 
-print(f"Running tracking on {len(image_paths)} frames...")
+for vid_id, vid_frames in video_groups.items():
+    print(f"\nTracking {vid_id} ({len(vid_frames)} frames)...")
 
-results = model.track(
-    source=sorted([str(p) for p in image_paths]),
-    tracker=TRACKER,
-    conf=MIN_CONF,
-    iou=0.5,
-    stream=True,
-    persist=True,
-)
+    results = model.track(
+        source=sorted([str(p) for p in vid_frames]),
+        tracker=TRACKER,
+        conf=MIN_CONF,
+        iou=0.5,
+        stream=True,
+        persist=True,
+    )
 
-for frame_idx, result in enumerate(results):
-    img_path   = image_paths[frame_idx]
-    label_path = label_dir / img_path.with_suffix(".txt").name
-    img_h, img_w = result.orig_shape
+    for frame_idx, result in enumerate(results):
+        img_path   = vid_frames[frame_idx]
+        label_path = label_dir / img_path.with_suffix(".txt").name
+        img_h, img_w = result.orig_shape
 
-    gt_boxes = load_gt(label_path, img_w, img_h)
+        gt_boxes = load_gt(label_path, img_w, img_h)
 
-    if result.boxes is None or result.boxes.id is None:
-        continue
-
-    for i in range(len(result.boxes)):
-        label    = result.names[int(result.boxes.cls[i].item())]
-        if label not in VALID_LABELS:
+        if result.boxes is None or result.boxes.id is None:
             continue
 
-        track_id = int(result.boxes.id[i].item())
-        conf     = result.boxes.conf[i].item()
-        x1, y1, x2, y2 = map(int, result.boxes.xyxy[i].tolist())
-        det_bbox = [x1, y1, x2, y2]
+        for i in range(len(result.boxes)):
+            label = result.names[int(result.boxes.cls[i].item())]
+            if label not in VALID_LABELS:
+                continue
 
-        # Match to ground truth
-        gt_class = match_to_gt(det_bbox, gt_boxes)
+            track_id        = int(result.boxes.id[i].item())
+            conf            = result.boxes.conf[i].item()
+            x1, y1, x2, y2 = map(int, result.boxes.xyxy[i].tolist())
+            gt_class        = match_to_gt([x1, y1, x2, y2], gt_boxes)
 
-        if track_id not in all_tracks:
-            all_tracks[track_id] = {
-                "confs":      [],
-                "labels":     [],
-                "gt_classes": [],   # ground truth class per detection
-                "frame_ids":  [],
-                "img_paths":  [],
-            }
+            key = (vid_id, track_id)
+            if key not in all_tracks:
+                all_tracks[key] = {
+                    "confs":      [],
+                    "labels":     [],
+                    "gt_classes": [],
+                    "frame_ids":  [],
+                    "img_paths":  [],
+                    "video_id":   vid_id,
+                    "track_id":   track_id,
+                }
 
-        all_tracks[track_id]["confs"].append(conf)
-        all_tracks[track_id]["labels"].append(label)
-        all_tracks[track_id]["gt_classes"].append(gt_class)  # None if no GT match
-        all_tracks[track_id]["frame_ids"].append(frame_idx)
-        all_tracks[track_id]["img_paths"].append(str(img_path))
+            all_tracks[key]["confs"].append(conf)
+            all_tracks[key]["labels"].append(label)
+            all_tracks[key]["gt_classes"].append(gt_class)
+            all_tracks[key]["frame_ids"].append(frame_idx)
+            all_tracks[key]["img_paths"].append(str(img_path))
 
-    if frame_idx % 500 == 0:
-        print(f"  Frame {frame_idx}/{len(image_paths)}...")
+        if frame_idx % 500 == 0:
+            print(f"  Frame {frame_idx}/{len(vid_frames)}...")
 
-print(f"\nDone. Total tracks: {len(all_tracks)}")
+print(f"\nDone. Total tracks across all videos: {len(all_tracks)}")
 
 
 # ── Cell 5: Compute per-track stats and ground truth ──────────────────────────
-for tid, t in all_tracks.items():
+for key, t in all_tracks.items():
     confs    = t["confs"]
     labels   = t["labels"]
-    gt_cls   = [g for g in t["gt_classes"] if g is not None]  # only matched frames
+    gt_cls   = [g for g in t["gt_classes"] if g is not None]
     is_mixed = "soldier" in labels and "civilian" in labels
 
     majority_label = "soldier" if labels.count("soldier") >= len(labels) / 2 else "civilian"
 
-    # Ground truth = majority of matched GT classes across all frames of this track
     if gt_cls:
-        gt_majority = "soldier" if gt_cls.count("soldier") >= len(gt_cls) / 2 else "civilian"
-        gt_match_rate = len(gt_cls) / len(labels)  # what fraction of frames had a GT match
+        gt_majority   = "soldier" if gt_cls.count("soldier") >= len(gt_cls) / 2 else "civilian"
+        gt_match_rate = len(gt_cls) / len(labels)
     else:
-        gt_majority   = None   # track never matched any GT box — likely FP
+        gt_majority   = None
         gt_match_rate = 0.0
 
     t["mean_conf"]         = round(np.mean(confs), 4)
@@ -191,9 +193,11 @@ for tid, t in all_tracks.items():
     t["is_mixed"]          = is_mixed
     t["n_frames"]          = len(confs)
 
-# Only keep tracks with reliable GT (matched in >30% of frames)
-labeled_tracks = {tid: t for tid, t in all_tracks.items()
-                  if t["ground_truth"] is not None and t["gt_match_rate"] > 0.3}
+# Only keep tracks with reliable GT match (>30% of frames matched)
+labeled_tracks = {
+    k: t for k, t in all_tracks.items()
+    if t["ground_truth"] is not None and t["gt_match_rate"] > 0.3
+}
 
 display(Markdown(f"""
 ## Track stats
@@ -265,7 +269,8 @@ for col, (metric, title) in enumerate(metrics):
     for tracks_list, label, color in categories:
         vals = [t[metric] for t in tracks_list]
         if vals:
-            ax.hist(vals, bins=20, alpha=0.5, color=color, label=f"{label} (n={len(vals)})")
+            ax.hist(vals, bins=20, alpha=0.5, color=color,
+                    label=f"{label} (n={len(vals)})")
     ax.set_title(title, fontsize=12)
     ax.set_xlabel("Value")
     ax.set_ylabel("Count")
@@ -276,7 +281,9 @@ for col, (metric, title) in enumerate(metrics):
         vals = [t[metric] for t in tracks_list]
         if vals:
             print(f"  {label:35s}: mean={np.mean(vals):.3f}  "
-                  f"std={np.std(vals):.3f}  min={np.min(vals):.3f}  max={np.max(vals):.3f}")
+                  f"std={np.std(vals):.3f}  "
+                  f"min={np.min(vals):.3f}  "
+                  f"max={np.max(vals):.3f}")
 
 plt.tight_layout()
 plt.show()
@@ -285,12 +292,13 @@ plt.show()
 # ── Cell 8: Threshold analysis — minimise missed soldiers ─────────────────────
 display(Markdown("## Threshold analysis — minimising missed soldiers"))
 
-all_missed   = missed_soldier + mixed_true_soldier
-all_labeled  = list(labeled_tracks.values())
+all_missed  = missed_soldier + mixed_true_soldier
+all_labeled = list(labeled_tracks.values())
 
 for metric, title in metrics:
     missed_vals = [t[metric] for t in all_missed]
     if not missed_vals:
+        print(f"\n{title}: no missed soldiers to analyze")
         continue
 
     all_vals   = [t[metric] for t in all_labeled]
@@ -299,33 +307,32 @@ for metric, title in metrics:
     rows = []
     for thresh in thresholds:
         if metric in ("mean_conf", "max_conf", "label_consistency"):
-            caught     = sum(1 for t in all_missed   if t[metric] < thresh)
-            total_sent = sum(1 for t in all_labeled  if t[metric] < thresh)
-        else:  # conf_std — high = confused
-            caught     = sum(1 for t in all_missed   if t[metric] > thresh)
-            total_sent = sum(1 for t in all_labeled  if t[metric] > thresh)
+            caught     = sum(1 for t in all_missed  if t[metric] < thresh)
+            total_sent = sum(1 for t in all_labeled if t[metric] < thresh)
+        else:  # conf_std — high std = confused
+            caught     = sum(1 for t in all_missed  if t[metric] > thresh)
+            total_sent = sum(1 for t in all_labeled if t[metric] > thresh)
 
         recall   = caught / len(all_missed) if all_missed else 0
         cost_pct = total_sent / len(all_labeled) * 100 if all_labeled else 0
         rows.append((thresh, recall, cost_pct))
+
+    # Find elbow — best recall/cost tradeoff
+    best_idx    = max(range(len(rows)),
+                      key=lambda i: rows[i][1] - rows[i][2] / 100)
+    best_thresh = rows[best_idx][0]
 
     fig, ax = plt.subplots(figsize=(10, 4))
     threshs = [r[0] for r in rows]
     recalls = [r[1] for r in rows]
     costs   = [r[2] / 100 for r in rows]
 
-    ax.plot(threshs, recalls, color="red",  linewidth=2, label="missed soldier recall")
-    ax.plot(threshs, costs,   color="blue", linewidth=2, label="fraction sent to Qwen")
-
-    # Find elbow — where recall gain per cost starts diminishing
-    best_idx = max(range(len(rows)),
-                   key=lambda i: rows[i][1] - rows[i][2] / 100)
-    best_thresh = rows[best_idx][0]
+    ax.plot(threshs, recalls, color="red",   linewidth=2, label="missed soldier recall")
+    ax.plot(threshs, costs,   color="blue",  linewidth=2, label="fraction sent to Qwen")
     ax.axvline(best_thresh, color="green", linestyle="--",
-               label=f"suggested threshold = {best_thresh:.3f} "
+               label=f"suggested = {best_thresh:.3f}  "
                      f"(recall={rows[best_idx][1]:.2f}, "
                      f"cost={rows[best_idx][2]:.1f}%)")
-
     ax.set_title(f"{title} — recall vs Qwen cost")
     ax.set_xlabel(metric)
     ax.set_ylabel("Fraction")
@@ -334,7 +341,7 @@ for metric, title in metrics:
     plt.tight_layout()
     plt.show()
 
-    print(f"\n{title} suggested threshold: {best_thresh:.3f}")
+    print(f"\n{title} — suggested threshold : {best_thresh:.3f}")
     print(f"  Catches {rows[best_idx][1]*100:.1f}% of missed soldiers")
     print(f"  Sends   {rows[best_idx][2]:.1f}% of all tracks to Qwen")
 
@@ -352,9 +359,9 @@ def should_send_to_qwen(track) -> bool:
         return True
 
     # Replace these with values from Cell 8
-    if track["mean_conf"]         < MEAN_CONF_THRESHOLD:         return True
-    if track["conf_std"]          > CONF_STD_THRESHOLD:          return True
-    if track["label_consistency"] < CONSISTENCY_THRESHOLD:       return True
+    if track["mean_conf"]         < MEAN_CONF_THRESHOLD:      return True
+    if track["conf_std"]          > CONF_STD_THRESHOLD:       return True
+    if track["label_consistency"] < CONSISTENCY_THRESHOLD:    return True
 
     return False
 ```
