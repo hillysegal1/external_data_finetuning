@@ -1,0 +1,335 @@
+# ╔══════════════════════════════════════════════════════════════════════════╗
+# ║         YOLO Track Threshold Analysis — Jupyter Notebook               ║
+# ║  Run on validation videos to find optimal Qwen validation thresholds   ║
+# ╚══════════════════════════════════════════════════════════════════════════╝
+
+
+# ── Cell 1: Config ─────────────────────────────────────────────────────────────
+from ultralytics import YOLO
+from pathlib import Path
+from IPython.display import display, Markdown
+import numpy as np
+import cv2
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+
+MODEL_PATH  = "your_finetuned_model.pt"
+TRACKER     = "custom_botsort.yaml"
+MIN_CONF    = 0.3       # lowest conf to consider — below this is noise
+VALID_LABELS = {"soldier", "civilian"}
+
+VAL_VIDEOS = [
+    "val_video_1.mp4",
+    "val_video_2.mp4",
+    "val_video_3.mp4",
+    "val_video_4.mp4",
+    "val_video_5.mp4",
+    "val_video_6.mp4",
+    "val_video_7.mp4",
+    "val_video_8.mp4",
+]
+
+
+# ── Cell 2: Run tracking on all validation videos ──────────────────────────────
+model      = YOLO(MODEL_PATH)
+all_tracks = {}  # (video_id, track_id) → stats
+
+for video_path in VAL_VIDEOS:
+    video_id = Path(video_path).stem
+    print(f"\nProcessing {video_id}...")
+
+    results = model.track(
+        source=video_path,
+        tracker=TRACKER,
+        conf=MIN_CONF,
+        iou=0.5,
+        stream=True,
+        persist=True,
+    )
+
+    for frame_idx, result in enumerate(results):
+        if result.boxes is None or result.boxes.id is None:
+            continue
+
+        for i in range(len(result.boxes)):
+            label    = result.names[int(result.boxes.cls[i].item())]
+            if label not in VALID_LABELS:
+                continue
+
+            track_id = int(result.boxes.id[i].item())
+            conf     = result.boxes.conf[i].item()
+            key      = (video_id, track_id)
+
+            if key not in all_tracks:
+                all_tracks[key] = {
+                    "confs":     [],
+                    "labels":    [],
+                    "frame_ids": [],
+                    "video_id":  video_id,
+                    "track_id":  track_id,
+                }
+
+            all_tracks[key]["confs"].append(conf)
+            all_tracks[key]["labels"].append(label)
+            all_tracks[key]["frame_ids"].append(frame_idx)
+
+    print(f"  Tracks so far: {len(all_tracks)}")
+
+# Compute stats per track
+for key, t in all_tracks.items():
+    confs    = t["confs"]
+    labels   = t["labels"]
+    majority = "soldier" if labels.count("soldier") >= len(labels) / 2 else "civilian"
+    is_mixed = "soldier" in labels and "civilian" in labels
+
+    t["mean_conf"]         = round(np.mean(confs), 4)
+    t["conf_std"]          = round(np.std(confs),  4)
+    t["max_conf"]          = round(np.max(confs),  4)
+    t["min_conf"]          = round(np.min(confs),  4)
+    t["label_consistency"] = round(labels.count(majority) / len(labels), 4)
+    t["majority_label"]    = majority
+    t["is_mixed"]          = is_mixed
+    t["n_frames"]          = len(confs)
+
+display(Markdown(f"""
+## Tracking complete
+| | |
+|---|---|
+| Total tracks | {len(all_tracks)} |
+| Soldier tracks | {sum(1 for t in all_tracks.values() if t['majority_label'] == 'soldier')} |
+| Civilian tracks | {sum(1 for t in all_tracks.values() if t['majority_label'] == 'civilian')} |
+| Mixed label tracks | {sum(1 for t in all_tracks.values() if t['is_mixed'])} |
+"""))
+
+
+# ── Cell 3: Visualize tracks for manual ground truth labeling ──────────────────
+# Run this cell to review tracks and fill in ground_truth dict below
+
+def show_track(key, track, n_frames=6):
+    video_id, track_id = key
+    cap = cv2.VideoCapture(f"{video_id}.mp4")
+
+    frame_ids = track["frame_ids"]
+    step      = max(1, len(frame_ids) // n_frames)
+    sample    = frame_ids[::step][:n_frames]
+
+    fig, axes = plt.subplots(1, len(sample), figsize=(16, 3))
+    if len(sample) == 1:
+        axes = [axes]
+
+    fig.suptitle(
+        f"{video_id} | track {track_id} | majority={track['majority_label']} | "
+        f"mixed={track['is_mixed']} | mean_conf={track['mean_conf']:.2f} | "
+        f"std={track['conf_std']:.2f} | consistency={track['label_consistency']:.2f} | "
+        f"n_frames={track['n_frames']}",
+        fontsize=9
+    )
+
+    for ax, fid in zip(axes, sample):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, fid)
+        ret, frame = cap.read()
+        if ret:
+            ax.imshow(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+            ax.set_title(f"f{fid}", fontsize=8)
+        ax.axis("off")
+
+    cap.release()
+    plt.tight_layout()
+    plt.show()
+
+# Show all tracks for labeling
+for key, track in all_tracks.items():
+    show_track(key, track)
+
+
+# ── Cell 4: Enter ground truth here after reviewing tracks ─────────────────────
+# Fill this in after running Cell 3
+# Format: {("video_stem", track_id): "soldier" | "civilian"}
+
+ground_truth = {
+    # ("val_video_1", 1): "soldier",
+    # ("val_video_1", 2): "civilian",
+    # ("val_video_2", 1): "soldier",
+    # ... add all tracks here
+}
+
+
+# ── Cell 5: Split tracks into categories ──────────────────────────────────────
+labeled = {k: t for k, t in all_tracks.items() if k in ground_truth}
+
+correct_soldier    = [t for k, t in labeled.items()
+                      if ground_truth[k] == "soldier"
+                      and t["majority_label"] == "soldier"
+                      and not t["is_mixed"]]
+
+missed_soldier     = [t for k, t in labeled.items()
+                      if ground_truth[k] == "soldier"
+                      and t["majority_label"] == "civilian"
+                      and not t["is_mixed"]]
+
+correct_civilian   = [t for k, t in labeled.items()
+                      if ground_truth[k] == "civilian"
+                      and t["majority_label"] == "civilian"
+                      and not t["is_mixed"]]
+
+false_soldier      = [t for k, t in labeled.items()
+                      if ground_truth[k] == "civilian"
+                      and t["majority_label"] == "soldier"
+                      and not t["is_mixed"]]
+
+mixed_true_soldier  = [t for k, t in labeled.items()
+                       if ground_truth[k] == "soldier"
+                       and t["is_mixed"]]
+
+mixed_true_civilian = [t for k, t in labeled.items()
+                       if ground_truth[k] == "civilian"
+                       and t["is_mixed"]]
+
+display(Markdown(f"""
+## Track categories
+| Category | Count |
+|---|---|
+| Correct soldier (pure) | {len(correct_soldier)} |
+| Missed soldier (called civilian) | {len(missed_soldier)} |
+| Correct civilian (pure) | {len(correct_civilian)} |
+| False soldier (civilian called soldier) | {len(false_soldier)} |
+| Mixed → actually soldier | {len(mixed_true_soldier)} |
+| Mixed → actually civilian | {len(mixed_true_civilian)} |
+"""))
+
+
+# ── Cell 6: Plot metric distributions ─────────────────────────────────────────
+metrics = [
+    ("mean_conf",         "Mean Confidence"),
+    ("conf_std",          "Confidence Std"),
+    ("label_consistency", "Label Consistency"),
+    ("max_conf",          "Max Confidence"),
+]
+
+categories = [
+    (correct_soldier,     "correct soldier",     "green"),
+    (missed_soldier,      "missed soldier",      "red"),
+    (correct_civilian,    "correct civilian",    "blue"),
+    (false_soldier,       "false soldier alarm", "orange"),
+    (mixed_true_soldier,  "mixed → soldier",     "darkgreen"),
+    (mixed_true_civilian, "mixed → civilian",    "purple"),
+]
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+axes = axes.flatten()
+
+for col, (metric, title) in enumerate(metrics):
+    ax = axes[col]
+    for tracks_list, label, color in categories:
+        vals = [t[metric] for t in tracks_list]
+        if vals:
+            ax.hist(vals, bins=20, alpha=0.5, color=color, label=label)
+
+    ax.set_title(title, fontsize=12)
+    ax.set_xlabel("Value")
+    ax.set_ylabel("Count")
+    ax.legend(fontsize=8)
+
+    # Print stats per category
+    print(f"\n{title}:")
+    for tracks_list, label, _ in categories:
+        vals = [t[metric] for t in tracks_list]
+        if vals:
+            print(f"  {label:30s}: mean={np.mean(vals):.3f}  std={np.std(vals):.3f}  "
+                  f"min={np.min(vals):.3f}  max={np.max(vals):.3f}")
+
+plt.tight_layout()
+plt.show()
+
+
+# ── Cell 7: Find threshold that minimises missed soldiers ──────────────────────
+# For each metric, find the value that catches the most missed soldiers
+# while keeping false alarms manageable
+
+display(Markdown("## Threshold analysis — minimising missed soldiers"))
+
+for metric, title in metrics:
+    missed_vals  = [t[metric] for t in missed_soldier + mixed_true_soldier]
+    correct_vals = [t[metric] for t in correct_soldier]
+
+    if not missed_vals or not correct_vals:
+        continue
+
+    # Try thresholds across the range
+    all_vals   = [t[metric] for t in labeled.values()]
+    thresholds = np.linspace(min(all_vals), max(all_vals), 50)
+
+    best_thresh  = None
+    best_recall  = 0
+    results_rows = []
+
+    for thresh in thresholds:
+        # "send to Qwen if below threshold" logic for mean_conf/max_conf
+        # "send to Qwen if above threshold" logic for conf_std
+        if metric in ("mean_conf", "max_conf", "label_consistency"):
+            send_to_qwen = lambda t: t[metric] < thresh
+        else:  # conf_std — high std = send to Qwen
+            send_to_qwen = lambda t: t[metric] > thresh
+
+        # How many missed soldiers would be caught
+        caught  = sum(1 for t in missed_soldier + mixed_true_soldier if send_to_qwen(t))
+        total_missed = len(missed_soldier) + len(mixed_true_soldier)
+        recall  = caught / total_missed if total_missed > 0 else 0
+
+        # How many total tracks sent to Qwen (cost)
+        total_sent = sum(1 for t in labeled.values() if send_to_qwen(t))
+        cost_pct   = total_sent / len(labeled) * 100
+
+        results_rows.append((thresh, recall, cost_pct))
+
+        if recall > best_recall:
+            best_recall = recall
+            best_thresh = thresh
+
+    # Plot recall vs cost
+    fig, ax = plt.subplots(figsize=(10, 4))
+    recalls   = [r[1] for r in results_rows]
+    costs     = [r[2] for r in results_rows]
+    threshs   = [r[0] for r in results_rows]
+
+    ax.plot(threshs, recalls, color="red",  label="soldier recall (caught/total missed)")
+    ax.plot(threshs, [c/100 for c in costs], color="blue", label="% tracks sent to Qwen")
+    ax.axvline(best_thresh, color="green", linestyle="--",
+               label=f"best threshold = {best_thresh:.3f}")
+    ax.set_title(f"{title} — recall vs Qwen cost")
+    ax.set_xlabel(metric)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+    print(f"\n{title} — best threshold: {best_thresh:.3f}")
+    print(f"  Catches {best_recall*100:.1f}% of missed soldiers")
+    print(f"  Sends {costs[list(threshs).index(min(threshs, key=lambda x: abs(x-best_thresh)))]:,.1f}% of tracks to Qwen")
+
+
+# ── Cell 8: Recommended thresholds summary ────────────────────────────────────
+display(Markdown("""
+## How to read the results
+
+Look at Cell 7 plots for each metric. You want the threshold where:
+- **Red line (recall) is high** — catching most missed soldiers
+- **Blue line (Qwen cost) is acceptable** — not sending everything to Qwen
+
+The sweet spot is where recall plateaus but cost is still reasonable.
+
+Then use the values in your pipeline:
+```python
+def should_send_to_qwen(track):
+    # Replace values below with your findings from Cell 7
+    if track["mean_conf"]         < MEAN_CONF_THRESHOLD:    return True
+    if track["conf_std"]          > STD_THRESHOLD:           return True
+    if track["label_consistency"] < CONSISTENCY_THRESHOLD:  return True
+    return False
+```
+
+**Mixed tracks** — always send to Qwen regardless of thresholds:
+```python
+if track["is_mixed"]:
+    return True
+```
+"""))
